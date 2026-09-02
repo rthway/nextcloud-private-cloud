@@ -47,7 +47,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to the registry
         # Skipped on a pull request or a dry run: there is nothing to push and
