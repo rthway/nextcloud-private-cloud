@@ -1,0 +1,311 @@
+# ---------------------------------------------------------------------------
+# Alert rules.
+#
+# Every alert names a runbook, and a test asserts both that the annotation
+# exists and that the file it points at does. An alert that fires at 3am and
+# offers no next step produces stress and no repair; a runbook link that 404s
+# is worse, because it is trusted.
+#
+# `for:` durations are chosen so a transient blip does not page. The most
+# expensive failure of a monitoring system is not missing an incident -- it is
+# crying wolf until people mute it.
+#
+# Severities:
+#   critical  users affected now, or within minutes. Page.
+#   warning   a trend that becomes critical if ignored. Ticket.
+# ---------------------------------------------------------------------------
+
+groups:
+
+  # -------------------------------------------------------------------------
+  - name: availability
+    rules:
+
+      - alert: NextcloudDown
+        # The outside-in probe, not container state. A container can be
+        # running and healthy while nginx returns 502 for every request.
+        expr: probe_success{job="blackbox-http", instance=~".*/status.php"} == 0
+        for: 2m
+        labels: {severity: critical, component: application}
+        annotations:
+          summary: "Nextcloud is not answering"
+          description: >-
+            status.php has failed for 2 minutes. Users cannot reach the
+            application.
+          runbook: docs/runbooks/application-down.md
+
+      - alert: NextcloudLoginDown
+        # status.php can answer while the application itself is broken: it is
+        # a lightweight endpoint that does not exercise the full request path.
+        expr: probe_success{job="blackbox-http", instance=~".*/login"} == 0
+        for: 3m
+        labels: {severity: critical, component: application}
+        annotations:
+          summary: "The Nextcloud login page is not reachable"
+          description: >-
+            /login has failed for 3 minutes while status.php may still be
+            passing. Usually a failed app upgrade or a PHP fatal error.
+          runbook: docs/runbooks/application-down.md
+
+      - alert: MariaDBDown
+        expr: mysql_up == 0
+        for: 1m
+        labels: {severity: critical, component: database}
+        annotations:
+          summary: "MariaDB is not reachable"
+          description: "Nextcloud has no datastore; every request is failing."
+          runbook: docs/runbooks/database-unavailable.md
+
+      - alert: RedisDown
+        # Not a cache outage. Redis holds Nextcloud's transactional file
+        # locks; without it Nextcloud falls back to database locking and
+        # concurrent access produces "file is locked" errors that users report
+        # as data corruption.
+        expr: redis_up == 0
+        for: 1m
+        labels: {severity: critical, component: cache}
+        annotations:
+          summary: "Redis is down -- file locking has failed over to the database"
+          description: >-
+            Expect "file is currently locked" errors under concurrent access.
+            This is a correctness problem, not a performance one.
+          runbook: docs/runbooks/redis-unavailable.md
+
+  # -------------------------------------------------------------------------
+  - name: nextcloud
+    rules:
+
+      # The alert this deployment exists to make possible.
+      #
+      # Nextcloud's background jobs run from a dedicated container. That
+      # container can be up, healthy and running a sleep loop while cron.php
+      # fails on every invocation -- and the consequences are invisible for
+      # weeks: trash never expires, shares never lapse, file scans never run,
+      # and the database fills with rows nothing cleans up.
+      #
+      # There is no process-level signal for this. The only evidence is that
+      # Nextcloud's own lastcron timestamp stops advancing, which is why
+      # scripts/healthcheck.sh reads it and why this alert exists.
+      - alert: NextcloudCronStale
+        expr: |
+          nextcloud_last_cron_timestamp_seconds > 0
+          and (time() - nextcloud_last_cron_timestamp_seconds) > 1800
+        for: 10m
+        labels: {severity: warning, component: application}
+        annotations:
+          summary: "Nextcloud background jobs have not run for over 30 minutes"
+          description: >-
+            The cron container may be up while cron.php fails on every run.
+            Trash expiry, share expiry, file scans and database cleanup are
+            all stalled.
+          runbook: docs/runbooks/cron-not-running.md
+
+      # NOTE ON WHAT IS NOT HERE
+      #
+      # There is no alert on 5xx rate. nginx-prometheus-exporter reads
+      # stub_status, which exposes connection counters and a total request
+      # count -- and no breakdown by status code. Open-source nginx has no
+      # endpoint that provides one; it is an nginx Plus feature.
+      #
+      # Writing an approximation and labelling it "error rate" would be worse
+      # than leaving the gap visible, so the status-code view is served from
+      # the nginx JSON access log in Loki, and the outside-in probes above are
+      # what page. MONITORING.md records the trade-off.
+
+  # -------------------------------------------------------------------------
+  - name: storage
+    rules:
+
+      - alert: DiskSpaceLow
+        expr: |
+          (node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"}
+            / node_filesystem_size_bytes{fstype!~"tmpfs|overlay"}) < 0.20
+        for: 10m
+        labels: {severity: warning, component: host}
+        annotations:
+          summary: "Less than 20% free on {{ $labels.mountpoint }}"
+          description: "{{ $value | humanizePercentage }} free."
+          runbook: docs/runbooks/disk-full.md
+
+      - alert: DiskSpaceCritical
+        # A file-sync server fills its disk faster than most workloads, and
+        # MariaDB stops accepting writes when it cannot extend. Recovering a
+        # full disk under a stopped database is materially harder than
+        # preventing it.
+        expr: |
+          (node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"}
+            / node_filesystem_size_bytes{fstype!~"tmpfs|overlay"}) < 0.10
+        for: 5m
+        labels: {severity: critical, component: host}
+        annotations:
+          summary: "Less than 10% free on {{ $labels.mountpoint }}"
+          description: "MariaDB will refuse writes when it cannot extend. Free space now."
+          runbook: docs/runbooks/disk-full.md
+
+      - alert: DiskWillFillIn24Hours
+        # Trend rather than threshold. This is the alert that lets someone fix
+        # the problem during working hours instead of at 3am, and on a service
+        # whose entire purpose is storing files it is the most useful one here.
+        expr: |
+          predict_linear(
+            node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"}[6h], 24 * 3600
+          ) < 0
+        for: 30m
+        labels: {severity: warning, component: host}
+        annotations:
+          summary: "{{ $labels.mountpoint }} is on track to fill within 24 hours"
+          description: >-
+            Based on the last 6 hours. On this stack it is usually user
+            uploads, then trash and version history that nothing has expired
+            because background jobs stopped.
+          runbook: docs/runbooks/disk-full.md
+
+  # -------------------------------------------------------------------------
+  - name: database
+    rules:
+
+      - alert: MariaDBConnectionsHigh
+        expr: |
+          mysql_global_status_threads_connected
+            / mysql_global_variables_max_connections > 0.8
+        for: 5m
+        labels: {severity: warning, component: database}
+        annotations:
+          summary: "MariaDB connections above 80% of the limit"
+          description: >-
+            {{ $value | humanizePercentage }} in use. Check PHP_FPM_MAX_CHILDREN
+            against max_connections before raising the limit -- raising it
+            without raising the container memory limit converts a connection
+            error into an OOM kill.
+          runbook: docs/runbooks/database-unavailable.md
+
+      - alert: MariaDBSlowQueries
+        expr: rate(mysql_global_status_slow_queries[10m]) > 1
+        for: 15m
+        labels: {severity: warning, component: database}
+        annotations:
+          summary: "MariaDB is logging over one slow query per second"
+          description: >-
+            Often a missing index after a Nextcloud upgrade. Nextcloud ships
+            `occ db:add-missing-indices` precisely because this happens.
+          runbook: docs/runbooks/high-cpu.md
+
+      - alert: MariaDBAborted
+        # Aborted connections usually mean the application could not
+        # authenticate or the connection died mid-query -- both worth seeing
+        # before users report them.
+        expr: rate(mysql_global_status_aborted_connects[10m]) > 0.1
+        for: 10m
+        labels: {severity: warning, component: database}
+        annotations:
+          summary: "MariaDB is aborting connections"
+          description: "Authentication failures, or connections dropped mid-query."
+          runbook: docs/runbooks/database-unavailable.md
+
+  # -------------------------------------------------------------------------
+  - name: cache
+    rules:
+
+      # The most important Redis alert here, and it is a correctness alert.
+      #
+      # redis.conf uses maxmemory-policy volatile-lru specifically so that
+      # keys WITHOUT a TTL -- which is what Nextcloud's file locks are --
+      # can never be evicted. If evictions are happening at all, either the
+      # policy has been changed to allkeys-* or memory pressure is high enough
+      # that cache entries are churning. The first case silently drops file
+      # locks and lets two processes write the same file.
+      - alert: RedisEvictingKeys
+        expr: rate(redis_evicted_keys_total[10m]) > 0
+        for: 10m
+        labels: {severity: warning, component: cache}
+        annotations:
+          summary: "Redis is evicting keys"
+          description: >-
+            Verify maxmemory-policy is still volatile-lru. Under allkeys-lru,
+            eviction can drop a file lock while a file is being written, which
+            is silent corruption rather than a cache miss.
+          runbook: docs/runbooks/redis-unavailable.md
+
+      - alert: RedisMemoryHigh
+        expr: redis_memory_used_bytes / redis_config_maxmemory > 0.9
+        for: 10m
+        labels: {severity: warning, component: cache}
+        annotations:
+          summary: "Redis is at {{ $value | humanizePercentage }} of maxmemory"
+          description: >-
+            Under volatile-lru, writes fail with OOM rather than silently
+            evicting locks. That is the correct failure, and it is still a
+            failure -- raise maxmemory or reduce cache pressure.
+          runbook: docs/runbooks/redis-unavailable.md
+
+  # -------------------------------------------------------------------------
+  - name: resources
+    rules:
+
+      - alert: ContainerMemoryNearLimit
+        expr: |
+          container_memory_working_set_bytes{name=~"nextcloud-.*"}
+            / container_spec_memory_limit_bytes{name=~"nextcloud-.*"} > 0.90
+        for: 10m
+        labels: {severity: warning, component: platform}
+        annotations:
+          summary: "{{ $labels.name }} is at {{ $value | humanizePercentage }} of its memory limit"
+          description: >-
+            For the app container, check PHP_FPM_MAX_CHILDREN against
+            PHP_MEMORY_LIMIT -- their product must fit inside the container
+            limit or the OOM killer fires before PHP's own limit does.
+          runbook: docs/runbooks/high-cpu.md
+
+      - alert: ContainerCpuThrottled
+        # Throttling is invisible in load averages and shows up to users only
+        # as unexplained latency.
+        expr: rate(container_cpu_cfs_throttled_seconds_total{name=~"nextcloud-.*"}[5m]) > 1
+        for: 15m
+        labels: {severity: warning, component: platform}
+        annotations:
+          summary: "{{ $labels.name }} is being CPU throttled"
+          description: "The limit, not the work, is making requests slow."
+          runbook: docs/runbooks/high-cpu.md
+
+  # -------------------------------------------------------------------------
+  - name: tls
+    rules:
+
+      - alert: TLSCertificateExpiringSoon
+        # 21 days is comfortably more than one ACME renewal cycle, so this
+        # fires only when renewal has genuinely stopped working.
+        expr: (probe_ssl_earliest_cert_expiry - time()) / 86400 < 21
+        for: 1h
+        labels: {severity: warning, component: tls}
+        annotations:
+          summary: "TLS certificate expires in {{ $value | printf \"%.0f\" }} days"
+          description: "Automated renewal appears to have stopped. There is still time."
+          runbook: docs/runbooks/certificate-expired.md
+
+      - alert: TLSCertificateExpiringCritical
+        expr: (probe_ssl_earliest_cert_expiry - time()) / 86400 < 7
+        for: 1h
+        labels: {severity: critical, component: tls}
+        annotations:
+          summary: "TLS certificate expires in {{ $value | printf \"%.0f\" }} days"
+          description: >-
+            On expiry every browser refuses the site AND every desktop and
+            mobile sync client stops. This is a full outage with a known date.
+          runbook: docs/runbooks/certificate-expired.md
+
+  # -------------------------------------------------------------------------
+  - name: monitoring-integrity
+    rules:
+
+      # Monitoring that fails silently is worse than none, because it is
+      # trusted. This watches the watchers.
+      - alert: PrometheusTargetDown
+        expr: up == 0
+        for: 10m
+        labels: {severity: warning, component: monitoring}
+        annotations:
+          summary: "Prometheus cannot scrape {{ $labels.job }} ({{ $labels.instance }})"
+          description: >-
+            Metrics from this target are missing, so any alert depending on
+            them is silently not evaluating.
+          runbook: docs/runbooks/application-down.md

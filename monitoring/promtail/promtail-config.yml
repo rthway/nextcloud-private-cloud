@@ -1,0 +1,151 @@
+# ---------------------------------------------------------------------------
+# Promtail -- ships Docker container logs to Loki.
+#
+# The important work here is in the pipeline stages. Shipping raw log lines
+# and parsing them at query time is possible but slow and repetitive; parsing
+# nginx's JSON at ingest means `status` and `request_time` are queryable
+# fields, which is what makes the status-code panel in Grafana feasible at
+# all given that stub_status provides no such breakdown.
+#
+# Label discipline: only low-cardinality values become labels. Loki builds an
+# index stream per unique label combination, so promoting something like a
+# request ID to a label creates one stream per request and destroys
+# performance. High-cardinality values stay in the line, where filter
+# expressions handle them perfectly well.
+# ---------------------------------------------------------------------------
+
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+  log_level: warn
+
+positions:
+  # Persisted on a volume so that a Promtail restart resumes where it left
+  # off rather than re-shipping every log it can still see.
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+    backoff_config:
+      min_period: 500ms
+      max_period: 5m
+      max_retries: 10
+
+scrape_configs:
+
+  - job_name: docker
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 15s
+
+    relabel_configs:
+      # Compose service name, not container name: the container name carries
+      # a replica index that would fragment streams on every scale change.
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_service']
+        target_label: 'service'
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_project']
+        target_label: 'project'
+      - source_labels: ['__meta_docker_container_name']
+        regex: '/(.*)'
+        target_label: 'container'
+
+      # Only this stack's containers. Without this filter Promtail ships logs
+      # from every unrelated container on the host.
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_project']
+        # Expanded by promtail itself (-config.expand-env=true in
+        # compose.observability.yml); promtail's expander does not support
+        # shell-style :- defaults, so the variable is passed in explicitly.
+        regex: '${COMPOSE_PROJECT_NAME}'
+        action: keep
+
+    pipeline_stages:
+      # Docker wraps each line in its own JSON envelope first.
+      - docker: {}
+
+      # --- nginx: parse the JSON access log ------------------------------
+      - match:
+          selector: '{service="proxy"}'
+          stages:
+            - json:
+                expressions:
+                  status: status
+                  request_method: request_method
+                  request_uri: request_uri
+                  request_time: request_time
+                  upstream_response_time: upstream_response_time
+                  remote_addr: remote_addr
+                  request_id: request_id
+
+            # status becomes a label: bounded cardinality (a few dozen codes)
+            # and it is the dimension every incident query starts from.
+            # request_uri and request_id deliberately do NOT -- they are
+            # effectively unbounded.
+            - labels:
+                status:
+                request_method:
+
+            # Promote latency to a metric so it can be graphed and alerted on
+            # without re-parsing logs at query time.
+            - metrics:
+                nginx_request_duration_seconds:
+                  type: Histogram
+                  description: "Request duration as observed by nginx"
+                  source: request_time
+                  config:
+                    buckets: [0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0]
+
+            # Drop the noisiest successful static-asset lines. They are the
+            # bulk of the volume and the least useful during an incident.
+            - drop:
+                expression: '"status":"200".*"request_uri":"/web/static/'
+                drop_counter_reason: static_asset_success
+
+      # --- Nextcloud: JSON log entries ------------------------------------
+      # log_type is set to 'errorlog' in zz-managed.config.php, so Nextcloud
+      # writes its structured JSON to stderr rather than to nextcloud.log
+      # inside the data directory -- which would otherwise grow without bound,
+      # ship nowhere, and be included in every backup.
+      - match:
+          selector: '{service="app"}'
+          stages:
+            - json:
+                expressions:
+                  nc_level: level
+                  nc_app: app
+                  nc_message: message
+                  nc_user: user
+                  nc_method: method
+                  nc_url: url
+            - labels:
+                nc_level:
+                nc_app:
+            # Nextcloud levels are numeric: 0 debug, 1 info, 2 warning,
+            # 3 error, 4 fatal. Mapping them to names makes the Grafana panels
+            # and any future alert readable without a lookup table.
+            - template:
+                source: level_name
+                template: '{{ if eq .nc_level "4" }}FATAL{{ else if eq .nc_level "3" }}ERROR{{ else if eq .nc_level "2" }}WARN{{ else if eq .nc_level "1" }}INFO{{ else }}DEBUG{{ end }}'
+            - labels:
+                level_name:
+
+      # --- MariaDB --------------------------------------------------------
+      - match:
+          selector: '{service="db"}'
+          stages:
+            - regex:
+                expression: '^(?P<timestamp>\S+\s+\S+)\s+(?P<thread>\d+)\s+\[(?P<level>\w+)\]'
+            - labels:
+                level:
+
+      # --- Nextcloud cron -------------------------------------------------
+      # Separated from the app container so a failing cron.php is greppable
+      # without wading through request logs.
+      - match:
+          selector: '{service="cron"}'
+          stages:
+            - json:
+                expressions:
+                  nc_level: level
+                  nc_app: app
+            - labels:
+                nc_app:

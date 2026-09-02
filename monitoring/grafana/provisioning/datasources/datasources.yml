@@ -1,0 +1,32 @@
+# Datasources are provisioned as code rather than clicked in, so that a
+# rebuilt Grafana comes back identical and so that the definition is
+# reviewable in a pull request.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      # Must match the shortest scrape_interval in prometheus.yml, or Grafana
+      # picks step values that produce misleading gaps in rate() graphs.
+      timeInterval: 15s
+      httpMethod: POST
+    editable: false
+
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    jsonData:
+      maxLines: 1000
+      # Links a trace-like jump from an nginx log line to the same request in
+      # other panels. request_id is emitted by nginx into every log line.
+      derivedFields:
+        - name: request_id
+          matcherRegex: '"request_id":"([a-f0-9]+)"'
+          datasourceUid: loki
+          url: '$${__value.raw}'
+    editable: false

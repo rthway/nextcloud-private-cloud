@@ -41,3 +41,6 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# Rendered from .env by scripts/gen-secrets.sh; contains a live password.
+monitoring/mysqld-exporter/my.cnf

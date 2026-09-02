@@ -1,0 +1,407 @@
+# ---------------------------------------------------------------------------
+# Observability overlay.
+#
+#   docker compose -f compose.yml -f compose.observability.yml up -d
+#   make up-obs
+#
+# Opt-in: it roughly doubles the stack's memory footprint.
+#
+# Unlike the Odoo project in this portfolio, Nextcloud DOES expose application
+# metrics -- the bundled serverinfo app publishes an OCS endpoint with user
+# counts, storage totals, share counts and the last cron run. That endpoint is
+# JSON over authenticated HTTP rather than Prometheus text, so it is scraped by
+# a small blackbox-style bridge rather than by a native exporter.
+#
+# What each source answers:
+#
+#   serverinfo    users, files, storage used, shares, last cron run
+#   mysqld        connections, InnoDB buffer pool, slow queries, locks
+#   redis         memory, evictions, connected clients, keyspace
+#   nginx         request rate, connection state
+#   blackbox      is it up from outside, and is TLS still valid
+#   cadvisor      per-container CPU, memory, throttling
+#   node          host CPU, memory, disk
+# ---------------------------------------------------------------------------
+
+services:
+
+  prometheus:
+    image: prom/prometheus:v3.14.0
+    restart: unless-stopped
+    security_opt: [no-new-privileges:true]
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+    user: "65534:65534"
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-15d}
+      - --web.enable-lifecycle
+      - --web.external-url=http://localhost:${PROMETHEUS_PORT:-9092}
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts:/etc/prometheus/alerts:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${PROMETHEUS_PORT:-9092}:9090"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/-/healthy"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    networks: [frontend, backend]
+    deploy:
+      resources:
+        limits: {memory: 1g}
+
+  grafana:
+    image: grafana/grafana:13.2.1
+    restart: unless-stopped
+    security_opt: [no-new-privileges:true]
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+    depends_on:
+      prometheus: {condition: service_healthy}
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
+      # A Grafana reachable without credentials is a map of the estate handed
+      # to whoever finds it.
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_USERS_ALLOW_ORG_CREATE: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_SECURITY_CONTENT_TYPE_PROTECTION: "true"
+      GF_LOG_LEVEL: warn
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${GRAFANA_PORT:-3002}:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks: [frontend]
+    deploy:
+      resources:
+        limits: {memory: 512m}
+
+  loki:
+    image: grafana/loki:3.6.11
+    restart: unless-stopped
+    security_opt: [no-new-privileges:true]
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+    user: "10001:10001"
+    command: -config.file=/etc/loki/loki-config.yml
+    volumes:
+      - ./monitoring/loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki-data:/loki
+    # No healthcheck: the Loki image is distroless -- no shell, no wget, no
+    # curl -- so nothing inside it can probe its own endpoint. It is probed
+    # over the network by blackbox instead (job: blackbox-internal), which is
+    # the better check anyway because it verifies reachability from outside.
+    networks: [frontend]
+    deploy:
+      resources:
+        limits: {memory: 512m}
+
+  promtail:
+    image: grafana/promtail:3.6.11
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+    depends_on:
+      # service_started, not service_healthy: Loki declares no healthcheck and
+      # returns 503 for ~15s after its ingester comes up. Promtail retries
+      # pushes with backoff, so starting early costs a few retried batches.
+      loki: {condition: service_started}
+    environment:
+      COMPOSE_PROJECT_NAME: ${COMPOSE_PROJECT_NAME:-nextcloud}
+    command:
+      - -config.file=/etc/promtail/promtail-config.yml
+      # Without this the ${COMPOSE_PROJECT_NAME} in the config is taken
+      # literally, the relabel filter matches nothing, and no logs ship at all.
+      - -config.expand-env=true
+    volumes:
+      - ./monitoring/promtail/promtail-config.yml:/etc/promtail/promtail-config.yml:ro
+      # Read access to the Docker socket is close to root on the host. Mounted
+      # :ro, which limits but does not eliminate that -- SECURITY.md carries
+      # the socket-proxy alternative.
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - promtail-positions:/tmp
+    networks: [frontend]
+    deploy:
+      resources:
+        limits: {memory: 256m}
+
+  # -------------------------------------------------------------------------
+  # Nextcloud application metrics.
+  # -------------------------------------------------------------------------
+  # This is the significant difference from the Odoo project in this
+  # portfolio, where the application exposes nothing and every signal has to
+  # be inferred from nginx and the database. Nextcloud ships a `serverinfo`
+  # app publishing an OCS endpoint with user counts, storage totals, share
+  # counts, active sessions and -- the one that matters operationally -- the
+  # last time background jobs actually ran.
+  #
+  # The endpoint is JSON over authenticated HTTP rather than Prometheus text,
+  # so a bridge is needed. This exporter is third-party but small, actively
+  # maintained and pinned; the alternative was writing one, which is more code
+  # to own for the same result.
+  #
+  # Authenticated with a dedicated serverinfo token rather than the admin
+  # password: the token grants read-only access to this one endpoint, so a
+  # compromised exporter cannot administer the instance.
+  nextcloud-exporter:
+    image: xperimental/nextcloud-exporter:0.9.1
+    restart: unless-stopped
+    security_opt: [no-new-privileges:true]
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+    depends_on:
+      app: {condition: service_healthy}
+    environment:
+      # Through the proxy rather than straight to PHP-FPM: FPM speaks FastCGI,
+      # not HTTP, so there is nothing to scrape on port 9000.
+      # The real hostname, resolved by the network alias on the proxy
+      # service. Using "https://proxy" sends Host: proxy, which Nextcloud
+      # rejects with 400 -- it is not in trusted_domains, and it should
+      # not be.
+      NEXTCLOUD_SERVER: "https://${NEXTCLOUD_DOMAIN:-nextcloud.localhost}"
+      NEXTCLOUD_AUTH_TOKEN: ${NEXTCLOUD_METRICS_TOKEN:?run scripts/gen-secrets.sh}
+      # Local development terminates on a self-signed certificate. Certificate
+      # validity is probed separately by blackbox against the real chain, so
+      # nothing is lost by not verifying on this internal hop.
+      NEXTCLOUD_TLS_SKIP_VERIFY: "true"
+      NEXTCLOUD_TIMEOUT: "10s"
+    networks: [frontend]
+    deploy:
+      resources:
+        limits: {memory: 64m}
+
+  # -------------------------------------------------------------------------
+  # Background-job metrics.
+  # -------------------------------------------------------------------------
+  # WHY THIS EXISTS
+  #
+  # The most valuable Nextcloud-specific alert is "background jobs have
+  # stopped", because that failure is completely silent: the cron container
+  # stays up and healthy running its sleep loop while cron.php fails on every
+  # invocation, and the consequences -- trash never expiring, shares never
+  # lapsing, file scans never running, the database filling with rows nothing
+  # cleans up -- take weeks to become visible.
+  #
+  # The serverinfo exporter above does NOT publish that timestamp. Rather than
+  # ship an alert referencing a metric nothing produces, this sidecar reads
+  # Nextcloud's own `lastcron` value and writes it as a Prometheus text file,
+  # which node_exporter's textfile collector picks up.
+  #
+  # It reuses the Nextcloud image, so there is no second image to maintain and
+  # occ is guaranteed to be the matching version.
+  # YAML anchors do not cross Compose files -- *nextcloud-common is defined in
+  # compose.yml and is not in scope here -- so this service is spelled out.
+  # It must stay in step with the app service's image and volumes; a sidecar
+  # running a different Nextcloud version would call the wrong occ.
+  cron-metrics:
+    image: ${NEXTCLOUD_IMAGE:-nextcloud-private-cloud}:${NEXTCLOUD_IMAGE_TAG:-local}
+    restart: unless-stopped
+    security_opt: [no-new-privileges:true]
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+    depends_on:
+      app: {condition: service_healthy}
+    # Runs as root to take ownership of the textfile volume, then drops to
+    # www-data for the occ call. The loop lives in a real script file rather
+    # than an inline command: it is lintable, testable, and avoids the nested
+    # quoting that an embedded shell loop inside a YAML block scalar produces.
+    entrypoint: ["/usr/local/bin/export-cron-metric.sh"]
+
+    environment:
+      MYSQL_HOST: db
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-nextcloud}
+      MYSQL_USER: ${MYSQL_USER:?set MYSQL_USER in .env}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?set MYSQL_PASSWORD in .env}
+      REDIS_HOST: redis
+      REDIS_HOST_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+    volumes:
+      - nextcloud-html:/var/www/html
+      - nextcloud-data:/var/www/html/data
+      - textfile-metrics:/textfile
+      - ./monitoring/cron-metrics/export-cron-metric.sh:/usr/local/bin/export-cron-metric.sh:ro
+    networks: [backend]
+    deploy:
+      resources:
+        limits: {memory: 256m}
+
+  # -------------------------------------------------------------------------
+  # MariaDB metrics.
+  # -------------------------------------------------------------------------
+  mysqld-exporter:
+    image: prom/mysqld-exporter:v0.20.0
+    restart: unless-stopped
+    security_opt: [no-new-privileges:true]
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+    depends_on:
+      db: {condition: service_healthy}
+    # Credentials come from a config file rather than DATA_SOURCE_NAME. The
+    # exporter deprecated the env-var form, and a connection string in the
+    # environment shows up in `docker inspect`.
+    command:
+      - --config.my-cnf=/etc/mysqld-exporter/.my.cnf
+      - --collect.info_schema.innodb_metrics
+      - --collect.info_schema.processlist
+      - --collect.info_schema.tables
+      - --collect.global_status
+      - --collect.global_variables
+      # kingpin boolean flags use --no-<flag>, not =false. `=false` is parsed
+      # as a positional argument and the exporter exits with the unhelpful
+      # "unexpected false, try --help".
+      #
+      # Disabled because this is a single node: SHOW SLAVE STATUS returns
+      # nothing and the collector logs an error on every scrape.
+      - --no-collect.slave_status
+    volumes:
+      - ./monitoring/mysqld-exporter/my.cnf:/etc/mysqld-exporter/.my.cnf:ro
+    networks: [backend]
+    deploy:
+      resources:
+        limits: {memory: 128m}
+
+  # -------------------------------------------------------------------------
+  # Redis metrics.
+  # -------------------------------------------------------------------------
+  # The evicted_keys counter matters more here than in a pure cache: Redis
+  # holds Nextcloud's file locks, and an eviction under the wrong policy drops
+  # a lock while a file is being written.
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.90.0-alpine
+    restart: unless-stopped
+    security_opt: [no-new-privileges:true]
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+    depends_on:
+      redis: {condition: service_healthy}
+    environment:
+      REDIS_ADDR: redis://redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+    networks: [backend]
+    deploy:
+      resources:
+        limits: {memory: 64m}
+
+  nginx-exporter:
+    image: nginx/nginx-prometheus-exporter:1.5.3
+    restart: unless-stopped
+    security_opt: [no-new-privileges:true]
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+    depends_on:
+      proxy: {condition: service_healthy}
+    command:
+      - --nginx.scrape-uri=http://proxy:8081/stub_status
+    networks: [frontend]
+    deploy:
+      resources:
+        limits: {memory: 64m}
+
+  blackbox:
+    image: prom/blackbox-exporter:v0.28.0
+    restart: unless-stopped
+    security_opt: [no-new-privileges:true]
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+    command:
+      - --config.file=/etc/blackbox/blackbox.yml
+    volumes:
+      - ./monitoring/blackbox/blackbox.yml:/etc/blackbox/blackbox.yml:ro
+    networks: [frontend]
+    deploy:
+      resources:
+        limits: {memory: 64m}
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.55.1
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+    # The most privileged container in the stack, and it needs to be to read
+    # cgroup and container state. Recorded in SECURITY.md rather than glossed
+    # over; dropping it in favour of node_exporter alone is a reasonable trade
+    # where per-container attribution is not needed.
+    privileged: true
+    devices:
+      - /dev/kmsg:/dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    command:
+      - --housekeeping_interval=15s
+      - --docker_only=true
+      - --store_container_labels=false
+    networks: [frontend]
+    deploy:
+      resources:
+        limits: {memory: 256m}
+
+  # On a Linux server this reports the actual host. Under Docker Desktop it
+  # reports the WSL2 virtual machine, whose disk and memory figures are the
+  # VM's and not Windows'. The series are still right to build alerts against.
+  node-exporter:
+    image: prom/node-exporter:v1.12.1
+    restart: unless-stopped
+    security_opt: [no-new-privileges:true]
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+    pid: host
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --path.rootfs=/host/root
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
+      # The textfile collector publishes any *.prom file dropped in this
+      # directory. It is how a metric that has no exporter gets into
+      # Prometheus without writing one.
+      - --collector.textfile.directory=/textfile
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      # No `rslave` propagation flag: Docker Desktop and WSL2 reject it
+      # outright ("path / is mounted on / but it is not a shared or slave
+      # mount") and the container never starts.
+      - /:/host/root:ro
+      - textfile-metrics:/textfile:ro
+    networks: [frontend]
+    deploy:
+      resources:
+        limits: {memory: 128m}
+
+volumes:
+  textfile-metrics:
+  prometheus-data:
+  grafana-data:
+  loki-data:
+  promtail-positions:

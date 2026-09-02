@@ -1,0 +1,139 @@
+# ---------------------------------------------------------------------------
+# Prometheus scrape configuration.
+#
+# Intervals are per-target rather than global: database and Redis metrics
+# change fast and are what you reach for during an incident; blackbox probes
+# are comparatively expensive and 30s is ample for "is it up".
+# ---------------------------------------------------------------------------
+
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  evaluation_interval: 15s
+  external_labels:
+    environment: local
+    service: nextcloud
+
+rule_files:
+  - /etc/prometheus/alerts/*.yml
+
+scrape_configs:
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Nextcloud's own metrics, via the serverinfo app. Unlike the Odoo project
+  # in this portfolio, real application-level signals are available here.
+  - job_name: nextcloud
+    scrape_interval: 30s
+    static_configs:
+      - targets: ['nextcloud-exporter:9205']
+        labels:
+          component: application
+
+  - job_name: mariadb
+    scrape_interval: 15s
+    static_configs:
+      - targets: ['mysqld-exporter:9104']
+        labels:
+          component: database
+
+  # Redis holds Nextcloud's file locks as well as its cache, so
+  # redis_evicted_keys_total is a correctness signal here, not just a
+  # capacity one.
+  - job_name: redis
+    scrape_interval: 15s
+    static_configs:
+      - targets: ['redis-exporter:9121']
+        labels:
+          component: cache
+
+  - job_name: nginx
+    scrape_interval: 15s
+    static_configs:
+      - targets: ['nginx-exporter:9113']
+        labels:
+          component: proxy
+
+  - job_name: cadvisor
+    scrape_interval: 30s
+    static_configs:
+      - targets: ['cadvisor:8080']
+    metric_relabel_configs:
+      # cAdvisor's default set is very wide and dominated by high-cardinality
+      # per-container filesystem and network series. Keeping only what the
+      # dashboards and alerts use is what makes 15 days of retention fit.
+      - source_labels: [__name__]
+        regex: 'container_(cpu_usage_seconds_total|memory_working_set_bytes|memory_usage_bytes|spec_memory_limit_bytes|cpu_cfs_throttled_seconds_total|fs_usage_bytes|last_seen)'
+        action: keep
+      - source_labels: [name]
+        regex: '^$'
+        action: drop
+
+  - job_name: node
+    scrape_interval: 30s
+    static_configs:
+      - targets: ['node-exporter:9100']
+
+  # Every other job reports from inside the system it describes, so a
+  # comprehensively broken stack can look quiet rather than broken. These
+  # probes are the ones that go red when nothing else does.
+  - job_name: blackbox-http
+    scrape_interval: 30s
+    metrics_path: /probe
+    params:
+      module: [nextcloud_http_2xx]
+    static_configs:
+      - targets:
+          - https://proxy/status.php
+          - https://proxy/login
+        labels:
+          component: endpoint
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox:9115
+
+  # Separate job because it needs a module that DOES verify the certificate,
+  # whereas the availability probes above must not -- a local self-signed
+  # certificate would otherwise make availability look broken.
+  - job_name: blackbox-tls
+    scrape_interval: 5m
+    metrics_path: /probe
+    params:
+      module: [tls_connect]
+    static_configs:
+      - targets: ['proxy:443']
+        labels:
+          component: tls
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox:9115
+
+  # Loki has no container healthcheck because its image contains no HTTP
+  # client. This probe is what actually reports whether log ingestion is
+  # available.
+  - job_name: blackbox-internal
+    scrape_interval: 30s
+    metrics_path: /probe
+    params:
+      module: [http_2xx_plain]
+    static_configs:
+      - targets: ['http://loki:3100/ready']
+        labels:
+          component: logging
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox:9115

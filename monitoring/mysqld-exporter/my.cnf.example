@@ -1,0 +1,13 @@
+# mysqld_exporter credentials.
+#
+# A config file rather than DATA_SOURCE_NAME in the environment: the exporter
+# deprecated the env-var form, and a connection string in the environment is
+# visible in `docker inspect` output.
+#
+# NOTE: this file is rendered from .env by scripts/gen-secrets.sh and is
+# git-ignored. The committed version is monitoring/mysqld-exporter/my.cnf.example.
+[client]
+host = db
+port = 3306
+user = nextcloud
+password = CHANGEME

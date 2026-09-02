@@ -1,0 +1,16 @@
+apiVersion: 1
+
+providers:
+  - name: nextcloud
+    orgId: 1
+    folder: Nextcloud
+    type: file
+    disableDeletion: true
+    # Dashboards are read-only in the UI: edits made by clicking are lost on
+    # the next container restart, which is confusing unless the UI says so.
+    # Change them in git and redeploy.
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

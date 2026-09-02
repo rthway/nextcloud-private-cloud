@@ -107,6 +107,35 @@ for var in "${SECRETS[@]}"; do
 done
 
 chmod 600 "${ENV_FILE}"
+
+# --- Derived credential files ----------------------------------------------
+# mysqld_exporter reads its credentials from a my.cnf rather than from
+# DATA_SOURCE_NAME: the environment-variable form is deprecated upstream, and
+# a connection string in the environment is visible in `docker inspect`.
+#
+# Rendered from .env so there is one source of truth for the password, and
+# git-ignored so the rendered file never reaches a commit.
+render_exporter_cnf() {
+    local src="${REPO_ROOT}/monitoring/mysqld-exporter/my.cnf.example"
+    local dst="${REPO_ROOT}/monitoring/mysqld-exporter/my.cnf"
+    [[ -f "${src}" ]] || return 0
+
+    local pw
+    pw="$(sed -n 's/^MYSQL_PASSWORD=//p' "${ENV_FILE}" | head -n1 | sed 's/#.*//' | xargs || true)"
+    local user
+    user="$(sed -n 's/^MYSQL_USER=//p' "${ENV_FILE}" | head -n1 | sed 's/#.*//' | xargs || true)"
+    [[ -n "${pw}" ]] || { warn "MYSQL_PASSWORD is empty; skipping exporter credentials"; return 0; }
+
+    awk -v u="${user:-nextcloud}" -v p="${pw}" '
+        /^user *=/     { print "user = " u; next }
+        /^password *=/ { print "password = " p; next }
+        { print }
+    ' "${src}" > "${dst}"
+    chmod 600 "${dst}"
+    log "rendered monitoring/mysqld-exporter/my.cnf"
+}
+render_exporter_cnf
+
 log "done: ${generated} generated, ${skipped} left unchanged"
 
 if [[ "${generated}" -gt 0 ]]; then

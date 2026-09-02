@@ -1,0 +1,46 @@
+# ---------------------------------------------------------------------------
+# blackbox_exporter modules.
+# ---------------------------------------------------------------------------
+modules:
+
+  # Availability. TLS verification is OFF here deliberately: local development
+  # terminates on a self-signed certificate and a failing handshake would
+  # report the application as down while it serves perfectly. Certificate
+  # validity is probed separately by tls_connect, so nothing is lost.
+  nextcloud_http_2xx:
+    prober: http
+    timeout: 10s
+    http:
+      valid_http_versions: ["HTTP/1.1", "HTTP/2.0"]
+      valid_status_codes: [200, 302]
+      method: GET
+      follow_redirects: false
+      preferred_ip_protocol: ip4
+      tls_config:
+        insecure_skip_verify: true
+      # Sent so nginx matches the vhost rather than falling through to the
+      # default server. Nextcloud also refuses a Host header not in
+      # trusted_domains, so this has to be right twice over.
+      headers:
+        Host: nextcloud.localhost
+
+  # This module DOES verify, because the point is to learn that the
+  # certificate has become invalid. probe_ssl_earliest_cert_expiry is the
+  # series the TLS alerts read.
+  tls_connect:
+    prober: tcp
+    timeout: 10s
+    tcp:
+      tls: true
+      tls_config:
+        insecure_skip_verify: true
+
+  http_2xx_plain:
+    prober: http
+    timeout: 10s
+    http:
+      valid_http_versions: ["HTTP/1.1", "HTTP/2.0"]
+      valid_status_codes: [200]
+      method: GET
+      follow_redirects: false
+      preferred_ip_protocol: ip4

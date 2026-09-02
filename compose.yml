@@ -348,8 +348,23 @@ services:
       start_period: 10s
 
     networks:
-      - frontend
-      - backend   # to reach PHP-FPM
+      frontend:
+        # A DNS alias for the real domain on the internal network.
+        #
+        # Without it, anything inside the stack reaching the proxy by service
+        # name sends `Host: proxy`, which Nextcloud rejects with HTTP 400
+        # because `proxy` is not in trusted_domains. The obvious workaround --
+        # adding `proxy` to trusted_domains -- weakens a genuine security
+        # control: that list is what stops host-header poisoning of generated
+        # links such as password-reset URLs.
+        #
+        # An alias solves it without touching the control. Internal clients
+        # (the metrics exporter, the smoke tests, blackbox) use the real
+        # hostname, so the Host header matches both server_name and
+        # trusted_domains exactly as a browser's would.
+        aliases:
+          - nextcloud.localhost
+      backend: {}   # to reach PHP-FPM
 
     deploy:
       resources:
