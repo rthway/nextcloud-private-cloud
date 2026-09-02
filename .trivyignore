@@ -1,0 +1,25 @@
+# ---------------------------------------------------------------------------
+# Trivy suppressions.
+#
+# Each entry is a deliberate decision with a reason, not a way to make a badge
+# green. Vulnerabilities are NOT suppressed here -- they are fixed, or
+# reported as unfixable in SECURITY.md.
+# ---------------------------------------------------------------------------
+
+# DS-0002: "Last USER command in Dockerfile should not be 'root'".
+#
+# The same finding hadolint reports as DL3002, and the same answer: PHP-FPM's
+# master process needs root to create the pool listener and to populate the
+# html volume on first start, then drops to www-data for every worker. An
+# image forced to a non-root USER does not start.
+#
+# The compensating controls are real and asserted rather than claimed:
+#   - the smoke suite verifies the WORKERS run as www-data in the running
+#     container, which is the fact this rule is a proxy for
+#   - compose.prod.yml sets cap_drop: ALL, adding back only SETUID, SETGID,
+#     CHOWN and DAC_OVERRIDE
+#   - no-new-privileges is set on every service and asserted by a test
+#   - the nginx vhost prevents uploaded files being executed as PHP
+#
+# See docs/adr/001-container-strategy.md.
+DS-0002

@@ -50,6 +50,26 @@ LABEL org.opencontainers.image.title="nextcloud-private-cloud" \
 
 USER root
 
+# --- Security patching -----------------------------------------------------
+# Apply available security updates to the OS packages inherited from the base
+# image. This is NOT the same as installing packages -- nothing new is added,
+# and the "no PHP extensions" note above still holds.
+#
+# It is here because a scan of this image found two genuinely fixable HIGH
+# CVEs in libexpat (CVE-2026-66046 and CVE-2026-76641, fixed in 2.8.4-r0)
+# that the upstream image had not yet picked up. Suppressing them would have
+# hidden the next one too.
+#
+# `apk upgrade` rather than a version pin: a pin here goes stale the moment
+# upstream rebuilds, and then silently downgrades nothing while looking
+# maintained. The reproducibility cost is real and is accepted deliberately --
+# the alternative is shipping known-vulnerable packages to keep a build
+# byte-identical, which is the wrong trade for an internet-facing file store.
+#
+# The base image itself stays pinned, so the blast radius is limited to
+# security patches within that Alpine release.
+RUN set -eux;     apk upgrade --no-cache;     rm -rf /var/cache/apk/*
+
 # PHP reads conf.d in alphabetical order and the last definition of a key
 # wins. The upstream image ships `nextcloud.ini` and `opcache-recommended.ini`,
 # so anything intended to override them must sort after both -- hence `zz-`.

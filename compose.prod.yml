@@ -1,0 +1,250 @@
+# ---------------------------------------------------------------------------
+# Production overlay.
+#
+#   docker compose -f compose.yml -f compose.prod.yml up -d
+#
+# What changes relative to the base stack:
+#
+#   * secrets move from environment variables to Docker secrets, so they stop
+#     appearing in `docker inspect` and in the process environment
+#   * the image is pulled rather than built locally
+#   * read-only root filesystems where the workload allows, with explicit
+#     tmpfs for the paths that genuinely need to be writable
+#   * capabilities dropped to what each process actually uses
+#   * log rotation sized for a busy instance
+#
+# VERIFICATION STATUS: validated by `docker compose config` in CI and rendered
+# successfully, but NOT run against a production host by the author. This is a
+# reference posture, not a deployment record. Review it; do not assume it.
+# ---------------------------------------------------------------------------
+
+services:
+
+  db:
+    environment:
+      # An environment variable is visible in `docker inspect`, in
+      # /proc/<pid>/environ to anything sharing the namespace, and in any
+      # crash reporter that captures the environment. A file read once at
+      # start is not.
+      MARIADB_PASSWORD_FILE: /run/secrets/mysql_password
+      MARIADB_ROOT_PASSWORD_FILE: /run/secrets/mysql_root_password
+      # Deliberately cleared. Setting both makes the image's entrypoint prefer
+      # the plain variable and silently ignore the secret, which looks like it
+      # is working.
+      MARIADB_PASSWORD:
+      MARIADB_ROOT_PASSWORD:
+    secrets:
+      - mysql_password
+      - mysql_root_password
+
+    # MariaDB is NOT read_only. It writes to its data directory, its binary
+    # logs, InnoDB temporary tablespaces and the socket, and pinning every one
+    # of those to a tmpfs would be a long list of mounts for very little gain
+    # on a container that already has no published port and sits on an
+    # internal network. Stated rather than quietly omitted.
+    cap_drop:
+      - ALL
+    cap_add:
+      # MariaDB drops from root to the mysql user at start.
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+      - CHOWN
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "10"
+
+    deploy:
+      resources:
+        limits:
+          # Raise in step with innodb_buffer_pool_size in
+          # config/mariadb/my.cnf. Changing one without the other is how a
+          # database gets OOM-killed under exactly the load it was resized for.
+          memory: 8g
+          cpus: "4"
+        reservations:
+          memory: 2g
+
+  redis:
+    # Redis holds file locks, so a read-only root filesystem would be a poor
+    # trade: it needs to write its AOF and RDB files, and losing persistence
+    # means losing every lock across a restart.
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "1"
+
+  app:
+    # Pull, do not build. A production host should run the artefact CI built,
+    # scanned and attested -- not one it compiled from whatever the working
+    # tree happened to contain.
+    #
+    # Prefer a digest over a tag for NEXTCLOUD_IMAGE_TAG: a tag is a mutable
+    # pointer, and "the same version" must mean the same bytes.
+    build: !reset null
+    image: ${NEXTCLOUD_IMAGE:?set NEXTCLOUD_IMAGE to the published image}:${NEXTCLOUD_IMAGE_TAG:?pin a digest or immutable tag}
+    pull_policy: always
+
+    environment:
+      MYSQL_PASSWORD_FILE: /run/secrets/mysql_password
+      REDIS_HOST_PASSWORD_FILE: /run/secrets/redis_password
+      NEXTCLOUD_ADMIN_PASSWORD_FILE: /run/secrets/nextcloud_admin_password
+      MYSQL_PASSWORD:
+      REDIS_HOST_PASSWORD:
+      NEXTCLOUD_ADMIN_PASSWORD:
+
+    secrets:
+      - mysql_password
+      - redis_password
+      - nextcloud_admin_password
+
+    # NOT read_only, and this is the honest reason: Nextcloud writes into
+    # /var/www/html during app installation and during every upgrade, and that
+    # path is a volume rather than the image layer. Marking the root
+    # filesystem read-only would still permit those writes while blocking
+    # PHP's session and opcache paths, producing a container that starts and
+    # fails at the first login. The Odoo project in this portfolio CAN be
+    # read_only because its writable paths are a short, fixed list.
+    #
+    # The compensating controls are capability dropping, no-new-privileges,
+    # non-root workers, and the nginx rules that stop uploaded files being
+    # executed as PHP.
+    cap_drop:
+      - ALL
+    cap_add:
+      # PHP-FPM's master starts as root to create the pool listener and to
+      # populate the html volume on first start, then drops to www-data for
+      # every worker.
+      - SETUID
+      - SETGID
+      - CHOWN
+      - DAC_OVERRIDE
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "10"
+
+    deploy:
+      resources:
+        limits:
+          # Must exceed PHP_FPM_MAX_CHILDREN x PHP_MEMORY_LIMIT, or the OOM
+          # killer fires before PHP's own memory_limit can reject a request --
+          # which turns a single bad request into a lost container.
+          memory: 12g
+          cpus: "6"
+        reservations:
+          memory: 2g
+
+  cron:
+    build: !reset null
+    image: ${NEXTCLOUD_IMAGE:?set NEXTCLOUD_IMAGE}:${NEXTCLOUD_IMAGE_TAG:?pin a digest or immutable tag}
+    pull_policy: always
+    environment:
+      MYSQL_PASSWORD_FILE: /run/secrets/mysql_password
+      REDIS_HOST_PASSWORD_FILE: /run/secrets/redis_password
+      MYSQL_PASSWORD:
+      REDIS_HOST_PASSWORD:
+    secrets:
+      - mysql_password
+      - redis_password
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          # Preview generation is what this needs headroom for; it is the most
+          # memory-hungry background job Nextcloud runs.
+          memory: 2g
+          cpus: "2"
+
+  proxy:
+    read_only: true
+    tmpfs:
+      - /var/run:rw,noexec,nosuid,size=8m
+      # /var/cache/nginx is NOT a tmpfs here. The base stack already mounts a
+      # named volume there, and Compose refuses to render when the same target
+      # is both:
+      #
+      #   services.proxy.volumes[5]: target /var/cache/nginx already mounted
+      #   as services.proxy.tmpfs[1]
+      #
+      # The named volume is also the better choice: a persistent proxy cache
+      # survives a restart, so a deploy does not force every client to refetch
+      # Nextcloud's asset bundles at once.
+      #
+      # The image's entrypoint renders templates into conf.d at start, so it
+      # cannot be part of the read-only layer.
+      - /etc/nginx/conf.d:rw,noexec,nosuid,size=4m
+
+    cap_drop:
+      - ALL
+    cap_add:
+      # nginx's master starts as root to bind 80 and 443 -- both privileged
+      # ports -- then drops to the nginx user for workers. Removing this means
+      # either unprivileged ports plus external mapping, or the
+      # nginx-unprivileged image; SECURITY.md sets out both.
+      - NET_BIND_SERVICE
+      - SETUID
+      - SETGID
+      - CHOWN
+
+    volumes:
+      # Certificates issued by certbot on the host, mounted read-only. The
+      # renewal deploy hook reloads nginx -- without it, renewal succeeds and
+      # nginx serves the old certificate until it restarts for an unrelated
+      # reason, which is invisible until the day the old one expires.
+      - /etc/letsencrypt/live/${NEXTCLOUD_DOMAIN}:/etc/nginx/tls:ro
+      - /etc/letsencrypt/archive:/etc/letsencrypt/archive:ro
+      - certbot-webroot:/var/www/certbot:ro
+      - nextcloud-html:/var/www/html:ro
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "10"
+
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "2"
+
+# ---------------------------------------------------------------------------
+secrets:
+  # Files on the host, mode 0400, owned by root. Under Swarm or another
+  # orchestrator these become managed secrets and `file:` is replaced by
+  # `external: true` -- the service definitions above do not change.
+  mysql_password:
+    file: ./secrets/mysql_password
+  mysql_root_password:
+    file: ./secrets/mysql_root_password
+  redis_password:
+    file: ./secrets/redis_password
+  nextcloud_admin_password:
+    file: ./secrets/nextcloud_admin_password
+
+volumes:
+  certbot-webroot:

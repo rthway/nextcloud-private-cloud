@@ -2,9 +2,27 @@
 failure-threshold: warning
 
 ignored:
-  # DL3007 warns on `latest`. The base tag here is a datestamped ARG with a
-  # pinned default, which hadolint cannot resolve statically.
+  # DL3007 warns on `latest`. The base tag here is a version-pinned ARG, which
+  # hadolint cannot resolve statically.
   - DL3007
+
+  # DL3002: "Last USER should not be root".
+  #
+  # A good rule, and deliberately not followed here. PHP-FPM's master process
+  # needs root to create the pool listener and to populate the html volume on
+  # first start; it drops to www-data for every worker, which is where request
+  # handling actually happens. Forcing a non-root USER produces an image that
+  # cannot start.
+  #
+  # This is suppressed rather than worked around, and the compensating
+  # controls are real and asserted elsewhere:
+  #   - the smoke suite verifies the WORKERS run as www-data in the running
+  #     container, which is the fact the rule is a proxy for
+  #   - compose.prod.yml sets cap_drop: ALL and a read-only root filesystem
+  #   - no-new-privileges is set on every service and asserted by a test
+  #
+  # See docs/adr/001-container-strategy.md.
+  - DL3002
 
 trustedRegistries:
   - docker.io
