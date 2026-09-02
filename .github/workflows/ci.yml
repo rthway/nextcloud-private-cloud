@@ -193,6 +193,9 @@ jobs:
         run: |
           ./scripts/gen-secrets.sh
           ./scripts/gen-local-tls.sh
+          # Belt and braces: the bind-mount source must exist before
+          # `docker compose up`, or Docker creates it root-owned.
+          mkdir -p backups
           # The runner has no free privileged ports and no reason to publish.
           sed -i 's/^HTTP_PORT=.*/HTTP_PORT=8080/;  s/^HTTPS_PORT=.*/HTTPS_PORT=8443/' .env
           # Fewer PHP workers than the default: the runner has 2 vCPU, and

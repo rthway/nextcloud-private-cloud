@@ -58,12 +58,22 @@ head_() { printf '\n\033[1m%s\033[0m\n' "$*"; }
 if [[ ! -f .env ]]; then
     printf 'no .env found; synthesising a throwaway one for validation only\n'
     cp .env.example .env.validate-tmp
-    sed -i 's/^MYSQL_PASSWORD=.*/MYSQL_PASSWORD=validation-only-not-a-real-secret/; \
-            s/^MYSQL_ROOT_PASSWORD=.*/MYSQL_ROOT_PASSWORD=validation-only-not-a-real-secret/; \
-            s/^REDIS_PASSWORD=.*/REDIS_PASSWORD=validation-only-not-a-real-secret/; \
-            s/^NEXTCLOUD_ADMIN_PASSWORD=.*/NEXTCLOUD_ADMIN_PASSWORD=validation-only-not-a-real-secret/; \
-            s/^NEXTCLOUD_METRICS_TOKEN=.*/NEXTCLOUD_METRICS_TOKEN=validation-only-not-a-real-secret/; \
-            s/^GRAFANA_ADMIN_PASSWORD=.*/GRAFANA_ADMIN_PASSWORD=validation-only-not-a-real-secret/' \
+    # One -e per expression, deliberately.
+    #
+    # An earlier version used a single quoted script with backslash
+    # line-continuations. Inside single quotes a backslash-newline is NOT a
+    # shell continuation -- it is a literal backslash, newline and leading
+    # whitespace inside the sed script, so only the first expression
+    # reliably applied. Every other secret stayed empty, and the failure
+    # surfaced only in CI (where this path runs) and never locally (where a
+    # real .env exists and this branch is skipped).
+    sed -i \
+        -e 's|^MYSQL_PASSWORD=.*|MYSQL_PASSWORD=validation-only-not-a-real-secret|' \
+        -e 's|^MYSQL_ROOT_PASSWORD=.*|MYSQL_ROOT_PASSWORD=validation-only-not-a-real-secret|' \
+        -e 's|^REDIS_PASSWORD=.*|REDIS_PASSWORD=validation-only-not-a-real-secret|' \
+        -e 's|^NEXTCLOUD_ADMIN_PASSWORD=.*|NEXTCLOUD_ADMIN_PASSWORD=validation-only-not-a-real-secret|' \
+        -e 's|^NEXTCLOUD_METRICS_TOKEN=.*|NEXTCLOUD_METRICS_TOKEN=validation-only-not-a-real-secret|' \
+        -e 's|^GRAFANA_ADMIN_PASSWORD=.*|GRAFANA_ADMIN_PASSWORD=validation-only-not-a-real-secret|' \
         .env.validate-tmp
     mv .env.validate-tmp .env
     trap 'rm -f "${REPO_ROOT}/.env"' EXIT

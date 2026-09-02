@@ -136,6 +136,20 @@ render_exporter_cnf() {
 }
 render_exporter_cnf
 
+# --- Bind-mount directories ------------------------------------------------
+# Created here, before anything starts the stack.
+#
+# ./backups is bind-mounted into the database container. If it does not exist
+# when Docker creates the mount, Docker creates it as root -- and the
+# unprivileged user running scripts/backup.sh then cannot create a directory
+# inside it:
+#
+#   mkdir: cannot create directory './backups/2026...': Permission denied
+#
+# Found by CI on a clean checkout. A local working copy already had the
+# directory, so it never surfaced there.
+mkdir -p "${REPO_ROOT}/backups"
+
 log "done: ${generated} generated, ${skipped} left unchanged"
 
 if [[ "${generated}" -gt 0 ]]; then
