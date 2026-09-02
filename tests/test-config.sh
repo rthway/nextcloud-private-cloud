@@ -89,9 +89,15 @@ docker compose config --quiet 2>/dev/null \
     && pass "compose.yml renders" \
     || { fail "compose.yml is invalid"; docker compose config 2>&1 | tail -5 | sed 's/^/        /'; }
 
-docker compose -f compose.yml -f compose.observability.yml config --quiet 2>/dev/null \
-    && pass "compose.yml + compose.observability.yml render" \
-    || fail "the observability overlay is invalid"
+if docker compose -f compose.yml -f compose.observability.yml config --quiet 2>/dev/null; then
+    pass "compose.yml + compose.observability.yml render"
+else
+    # Printing the reason is not optional. An earlier version reported only
+    # "the observability overlay is invalid", which said nothing useful when
+    # it failed in CI and passed locally.
+    fail "the observability overlay is invalid"
+    docker compose -f compose.yml -f compose.observability.yml config 2>&1 | tail -6 | sed 's/^/        /'
+fi
 
 mkdir -p secrets
 for f in mysql_password mysql_root_password redis_password nextcloud_admin_password; do

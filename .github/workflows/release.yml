@@ -92,7 +92,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Trivy scan (gate)
-        uses: aquasecurity/trivy-action@0.36.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: image
           image-ref: scan-target:${{ github.sha }}
@@ -105,7 +105,7 @@ jobs:
       # this keeps them visible rather than discarded.
       - name: Trivy report (informational)
         if: always()
-        uses: aquasecurity/trivy-action@0.36.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: image
           image-ref: scan-target:${{ github.sha }}
@@ -115,7 +115,7 @@ jobs:
           exit-code: "0"
 
       - name: Generate SBOM
-        uses: aquasecurity/trivy-action@0.36.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: image
           image-ref: scan-target:${{ github.sha }}
