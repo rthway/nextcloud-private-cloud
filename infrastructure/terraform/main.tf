@@ -81,6 +81,17 @@ resource "aws_s3_bucket_versioning" "primary" {
   }
 }
 
+# SSE-S3 here, customer-managed KMS on the backup bucket below. The difference
+# is request volume, and the split is deliberate rather than an oversight.
+#
+# Nextcloud makes an S3 request per file operation. KMS charges per request, so
+# on a busy instance the KMS bill for primary storage can exceed the storage
+# bill itself. Backups are written once a night: the request cost is negligible
+# and a customer-managed key buys exactly what you want protecting the last
+# copy of the data -- separate access control, rotation, and revocation by
+# disabling the key.
+#
+# trivy:ignore:AWS-0132
 resource "aws_s3_bucket_server_side_encryption_configuration" "primary" {
   count = var.enable_primary_storage_bucket ? 1 : 0
 
@@ -88,10 +99,6 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "primary" {
 
   rule {
     apply_server_side_encryption_by_default {
-      # SSE-S3 rather than SSE-KMS. KMS charges per request, and Nextcloud
-      # makes one request per file operation -- on a busy instance the KMS
-      # bill can exceed the storage bill. SSE-KMS is the right answer when
-      # key custody is a requirement; it should be a deliberate choice.
       sse_algorithm = "AES256"
     }
     bucket_key_enabled = true
@@ -158,13 +165,36 @@ resource "aws_s3_bucket_versioning" "backup" {
   }
 }
 
+# A customer-managed KMS key for backups.
+#
+# This is what makes access to the last copy of the data revocable
+# independently of IAM: disabling the key makes every object unreadable
+# immediately, without editing a single policy.
+resource "aws_kms_key" "backup" {
+  description             = "${var.project_name}-${var.environment} Nextcloud backup encryption"
+  deletion_window_in_days = 30
+  enable_key_rotation     = true
+
+  tags = {
+    Name = "${var.project_name}-${var.environment}-backup"
+  }
+}
+
+resource "aws_kms_alias" "backup" {
+  name          = "alias/${var.project_name}-${var.environment}-backup"
+  target_key_id = aws_kms_key.backup.key_id
+}
+
 resource "aws_s3_bucket_server_side_encryption_configuration" "backup" {
   bucket = aws_s3_bucket.backup.id
 
   rule {
     apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256"
+      sse_algorithm     = "aws:kms"
+      kms_master_key_id = aws_kms_key.backup.arn
     }
+    # Bucket keys cut KMS request volume substantially, by deriving a
+    # short-lived key per bucket rather than calling KMS for every object.
     bucket_key_enabled = true
   }
 }
@@ -331,6 +361,25 @@ resource "aws_iam_user_policy" "backup" {
         Effect   = "Deny"
         Action   = ["s3:DeleteObject", "s3:DeleteObjectVersion"]
         Resource = ["${aws_s3_bucket.backup.arn}/*"]
+      },
+      {
+        # Required to write to and read from a KMS-encrypted bucket. Scoped to
+        # this one key rather than kms:* across the account.
+        #
+        # Note what is NOT granted: kms:ScheduleKeyDeletion and kms:DisableKey.
+        # A compromised backup host must not be able to make every existing
+        # backup unreadable, which is a quieter way to destroy them than
+        # deleting the objects.
+        Sid    = "UseBackupKey"
+        Effect = "Allow"
+        Action = [
+          "kms:Encrypt",
+          "kms:Decrypt",
+          "kms:ReEncrypt*",
+          "kms:GenerateDataKey*",
+          "kms:DescribeKey",
+        ]
+        Resource = [aws_kms_key.backup.arn]
       },
     ]
   })
