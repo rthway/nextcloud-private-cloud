@@ -3,6 +3,10 @@
 .env.*
 !.env.example
 !.env.*.example
+# Both forms. `secrets/` matches only a directory, so `git check-ignore
+# secrets` reports it as un-ignored until the directory actually exists --
+# which makes a pre-commit audit look like it found a problem.
+secrets
 secrets/
 *.pem
 *.key
