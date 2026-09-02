@@ -1,0 +1,162 @@
+# ---------------------------------------------------------------------------
+# Nextcloud virtual host.
+#
+# Rendered at container start: /etc/nginx/templates/*.template ->
+# /etc/nginx/conf.d/*. Only ${NEXTCLOUD_*} and ${PHP_*} are substituted
+# (NGINX_ENVSUBST_FILTER in compose.yml) so nginx's own $variables survive --
+# without that filter they become empty strings and the access log silently
+# turns into a row of blanks.
+#
+# This vhost follows Nextcloud's published nginx configuration. Several blocks
+# below look optional and are not; each one is annotated with what breaks
+# without it.
+# ---------------------------------------------------------------------------
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${NEXTCLOUD_DOMAIN};
+
+    # ACME http-01 challenge, served over plain HTTP by necessity -- it is how
+    # the certificate securing everything else gets issued and renewed.
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+        default_type "text/plain";
+    }
+
+    location / {
+        # 301, not 302: a temporary redirect keeps browsers returning over
+        # cleartext indefinitely.
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name ${NEXTCLOUD_DOMAIN};
+
+    ssl_certificate     /etc/nginx/tls/fullchain.pem;
+    ssl_certificate_key /etc/nginx/tls/privkey.pem;
+
+    include /etc/nginx/snippets/security-headers.conf;
+
+    root /var/www/html;
+    index index.php index.html /index.php$request_uri;
+
+    client_max_body_size ${PHP_UPLOAD_LIMIT};
+    limit_conn nc_conn 64;
+
+    # Nextcloud sends its own Range handling for chunked uploads and video
+    # streaming; letting nginx buffer the whole response defeats both.
+    fastcgi_buffers 64 4K;
+    fastcgi_request_buffering off;
+
+    # --- Service discovery -------------------------------------------------
+    # CalDAV and CardDAV clients look for /.well-known/caldav and /carddav.
+    # Without these redirects, calendar and contact sync fails to auto-discover
+    # and Nextcloud's own admin overview reports a setup warning. This is the
+    # single most commonly missed block in a hand-written Nextcloud vhost.
+    location = /.well-known/carddav { return 301 /remote.php/dav/; }
+    location = /.well-known/caldav  { return 301 /remote.php/dav/; }
+    location = /.well-known/webfinger   { return 301 /index.php$uri; }
+    location = /.well-known/nodeinfo    { return 301 /index.php$uri; }
+    location ^~ /.well-known {
+        return 301 /index.php$uri;
+    }
+
+    # --- Paths that must never be served -----------------------------------
+    # These are not merely tidy. data/ holds every user's files; config/ holds
+    # the database password. Serving either as static content is a total
+    # compromise, and a misconfigured vhost that omits this is a well-known
+    # way to leak a Nextcloud instance.
+    location ~ ^/(?:build|tests|config|lib|3rdparty|templates|data)(?:$|/)  { return 404; }
+    location ~ ^/(?:\.|autotest|occ|issue|indie|db_|console)              { return 404; }
+
+    # --- PHP ---------------------------------------------------------------
+    # Only these entry points are executable. An open `location ~ \.php$`
+    # would let any uploaded .php file in the data directory be executed --
+    # which, on a file-sharing server that accepts arbitrary uploads, is
+    # remote code execution by design.
+    location ~ \.php(?:$|/) {
+        rewrite ^/(?!index|remote|public|cron|core\/ajax\/update|status|ocs\/v[12]|updater\/.+|ocs-provider\/.+|.+\/richdocumentscode(_arm64)?\/proxy) /index.php$request_uri;
+
+        fastcgi_split_path_info ^(.+?\.php)(/.*)$;
+        set $path_info $fastcgi_path_info;
+
+        # try_files with =404 rather than a bare fastcgi_pass. Without it,
+        # nginx forwards a request for a non-existent .php file to FPM, and a
+        # path-traversal in the request can be turned into arbitrary file
+        # execution.
+        try_files $fastcgi_script_name =404;
+
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_param PATH_INFO $path_info;
+        fastcgi_param HTTPS on;
+        fastcgi_param modHeadersAvailable true;
+        # Tells Nextcloud not to offer its web-based updater. Updates here are
+        # an image pin changed deliberately, not a button anyone clicks.
+        fastcgi_param front_controller_active true;
+
+        fastcgi_pass php-handler;
+        fastcgi_intercept_errors on;
+        fastcgi_request_buffering off;
+
+        # Large uploads, `occ` operations through the web UI, and preview
+        # generation all legitimately exceed the 60s default. A 504 halfway
+        # through a large upload makes users retry, which makes it worse.
+        fastcgi_read_timeout 3600s;
+        fastcgi_send_timeout 3600s;
+        fastcgi_connect_timeout 60s;
+
+        fastcgi_max_temp_file_size 0;
+    }
+
+    # --- Login rate limiting ----------------------------------------------
+    # Applied at server level, keyed by the map in nginx.conf so it only
+    # counts login requests. burst=5 nodelay lets a genuine user fumble their
+    # password at full speed while throttling sustained attempts.
+    #
+    # This is a blunt first line only. Nextcloud's own brute-force protection
+    # -- enabled in zz-managed.config.php -- is the control that matters: it
+    # applies exponential backoff per account rather than per address, so it
+    # survives an attacker rotating through a proxy pool. It is also the one
+    # that depends on trusted_proxies being correct.
+    limit_req zone=nc_login burst=5 nodelay;
+    limit_req_status 429;
+
+    # --- Static assets -----------------------------------------------------
+    # Served by nginx directly from the shared volume, never entering PHP.
+    # The web UI is thousands of small files; routing them through FPM would
+    # occupy a worker per icon and is the difference between a snappy UI and a
+    # slow one.
+    location ~ \.(?:css|js|mjs|svg|gif|png|jpg|ico|wasm|tflite|map|ogg|flac)$ {
+        try_files $uri /index.php$request_uri;
+        # Nextcloud appends a version query string to asset URLs, so they are
+        # safe to cache for a long time -- a new version changes the URL.
+        expires 6M;
+        access_log off;
+        location ~ \.wasm$ {
+            default_type application/wasm;
+        }
+    }
+
+    location ~ \.woff2?$ {
+        try_files $uri /index.php$request_uri;
+        expires 7d;
+        access_log off;
+    }
+
+    # /remote.php is WebDAV -- the desktop and mobile sync clients. High
+    # volume, long-lived, and not worth logging every request of.
+    location /remote {
+        return 301 /remote.php$request_uri;
+    }
+
+    location / {
+        limit_req zone=nc_general burst=200 nodelay;
+        try_files $uri $uri/ /index.php$request_uri;
+    }
+}

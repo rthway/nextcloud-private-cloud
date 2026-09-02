@@ -1,0 +1,42 @@
+# yamllint configuration.
+#
+# Relaxed where the default is dogma and strict where a mistake would matter.
+extends: default
+
+rules:
+  line-length:
+    max: 120
+    level: warning
+    allow-non-breakable-words: true
+
+  # Compose and Prometheus configs both use lists indented under their key;
+  # insisting otherwise would mean reformatting upstream-shaped files.
+  indentation:
+    spaces: consistent
+    indent-sequences: consistent
+
+  comments:
+    min-spaces-from-content: 1
+
+  # Aligned values are used deliberately in monitoring/prometheus/postgres-queries.yml,
+  # where a column of metric definitions reads far better lined up. The rule
+  # catches no real defect, so it is the rule that gives way.
+  colons:
+    max-spaces-after: -1
+
+  # Docker Compose uses `on`/`off`/`yes`/`no` as plain strings in places;
+  # the truthy check produces noise without catching real defects here.
+  truthy:
+    check-keys: false
+
+  document-start: disable
+
+  # Grafana and Prometheus configs legitimately carry long single-line
+  # expressions that cannot be wrapped.
+  braces:
+    max-spaces-inside: 1
+
+ignore: |
+  .git/
+  tests/.tmp/
+  backups/

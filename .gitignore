@@ -1,0 +1,39 @@
+# Secrets -- never commit. Only *.example files belong in version control.
+.env
+.env.*
+!.env.example
+!.env.*.example
+secrets/
+*.pem
+*.key
+!config/nginx/tls/.gitkeep
+
+# Locally generated TLS material (scripts/gen-local-tls.sh)
+config/nginx/tls/*
+!config/nginx/tls/.gitkeep
+
+# Backup artefacts -- these contain user files and are large
+backups/
+*.dump
+*.sql
+*.tar.gz
+*.tar.zst
+
+# Test fixtures generated at run time
+tests/.tmp/
+
+# Terraform
+infrastructure/terraform/.terraform/
+infrastructure/terraform/*.tfstate
+infrastructure/terraform/*.tfstate.*
+infrastructure/terraform/*.tfvars
+!infrastructure/terraform/*.tfvars.example
+infrastructure/terraform/.terraform.lock.hcl.bak
+infrastructure/terraform/backend.hcl
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

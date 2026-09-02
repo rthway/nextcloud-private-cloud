@@ -1,0 +1,124 @@
+<?php
+/**
+ * Managed Nextcloud configuration -- TEMPLATE.
+ *
+ * Rendered at container start into config/zz-managed.config.php. Nextcloud
+ * merges every *.config.php in that directory over config.php in filename
+ * order, so the zz- prefix makes these settings win.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT IS DELIBERATELY NOT HERE
+ *
+ * The upstream image already generates config fragments from environment
+ * variables, and duplicating them here would be worse than useless -- because
+ * Nextcloud merges these files with array_merge(), a nested array defined
+ * again in a later file REPLACES the earlier one wholesale rather than being
+ * merged into it. Redefining 'redis' with only a timeout would therefore
+ * delete the host and password upstream had set.
+ *
+ * Verified present in nextcloud:34.0.3-fpm-alpine:
+ *
+ *   redis.config.php          memcache.distributed, memcache.locking, redis[]
+ *   apcu.config.php           memcache.local
+ *   reverse-proxy.config.php  trusted_proxies, overwriteprotocol, overwritecliurl
+ *   s3.config.php             objectstore
+ *   smtp.config.php           mail_*
+ *
+ * So caching, locking, proxy trust and object storage are all configured by
+ * upstream from the environment set in compose.yml. This file carries only
+ * what upstream does NOT set. Check before adding anything:
+ *
+ *   docker compose exec app ls /usr/src/nextcloud/config/
+ * ---------------------------------------------------------------------------
+ */
+$CONFIG = [
+
+    // --- Background jobs --------------------------------------------------
+    // The most consequential setting in this file, and upstream does not set
+    // it: the default is 'ajax', which runs scheduled work only when a user
+    // loads a page. On a quiet instance that means file scans, trash expiry,
+    // share expiry, preview generation and database cleanup simply never
+    // happen. It is the single most common misconfiguration in a self-hosted
+    // Nextcloud, and it degrades silently.
+    //
+    // 'cron' means an external scheduler runs cron.php -- the dedicated cron
+    // container in compose.yml.
+    'backgroundjobs_mode' => 'cron',
+
+    // --- Storage ----------------------------------------------------------
+    // Unlimited by default means one user can fill the disk for everyone.
+    'default_quota' => '${DEFAULT_QUOTA}',
+
+    // Chunked uploads: large files arrive in pieces and are assembled
+    // server-side, which is what lets a 10 GB upload survive a dropped
+    // connection instead of restarting from zero.
+    'max_chunk_size' => 104857600,
+
+    // Trash and versions are storage nobody accounts for until the disk is
+    // full. 'auto' lets Nextcloud shorten these when space runs low.
+    'trashbin_retention_obligation' => 'auto, 30',
+    'versions_retention_obligation' => 'auto, 90',
+
+    // --- Logging ----------------------------------------------------------
+    // errorlog sends entries to stderr, so the container runtime owns
+    // collection and rotation. The default writes nextcloud.log inside the
+    // data directory, which grows without bound, is not shipped anywhere, and
+    // is included in every backup.
+    'log_type' => 'errorlog',
+    'loglevel' => 2,
+    'logtimezone' => 'UTC',
+
+    // --- Security ---------------------------------------------------------
+    // Brute-force protection is only effective when trusted_proxies is
+    // correct -- which upstream sets from TRUSTED_PROXIES. Set too broadly,
+    // every request appears to come from the proxy and the throttle applies
+    // to all users at once instead of to the attacker.
+    'auth.bruteforce.protection.enabled' => true,
+
+    // Argon2id parameters. Memory cost is the one that matters against GPU
+    // cracking; the defaults are conservative.
+    'hashingThreads' => 4,
+    'hashingMemoryCost' => 65536,
+    'hashingTimeCost' => 4,
+
+    'login_form_autocomplete' => false,
+
+    // Sessions expire. The default keeps one alive indefinitely while the
+    // browser stays open.
+    'session_lifetime' => 86400,
+    'session_keepalive' => true,
+    'remember_login_cookie_lifetime' => 1209600,
+
+    // --- Previews ---------------------------------------------------------
+    // Preview generation is the most CPU- and memory-hungry thing Nextcloud
+    // does. The default provider list pulls in ImageMagick coders that have a
+    // poor security history for formats few users need; this list is
+    // deliberately narrow and pairs with the ImageMagick policy in the image.
+    'enable_previews' => true,
+    'enabledPreviewProviders' => [
+        'OC\\Preview\\PNG',
+        'OC\\Preview\\JPEG',
+        'OC\\Preview\\GIF',
+        'OC\\Preview\\BMP',
+        'OC\\Preview\\HEIC',
+        'OC\\Preview\\TXT',
+        'OC\\Preview\\MarkDown',
+        'OC\\Preview\\PDF',
+    ],
+    // Bounds the memory a single preview can consume. A crafted image that
+    // decompresses to an enormous bitmap is otherwise a denial-of-service
+    // vector against the whole worker pool.
+    'preview_max_x' => 2048,
+    'preview_max_y' => 2048,
+    'preview_max_memory' => 256,
+
+    // --- Operational ------------------------------------------------------
+    // Do not check for updates from within the application. The version is a
+    // deliberate image pin here; an in-app notification only creates pressure
+    // to click something that would not work anyway, because the web updater
+    // cannot rewrite a container image.
+    'updatechecker' => false,
+
+    // Heavy maintenance jobs start at 01:00 UTC rather than during the day.
+    'maintenance_window_start' => 1,
+];

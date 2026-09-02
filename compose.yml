@@ -1,0 +1,378 @@
+# ---------------------------------------------------------------------------
+# Nextcloud private cloud -- base stack.
+#
+#   compose.yml                              base -- what `make up` runs
+#   compose.yml + compose.observability.yml  adds Prometheus/Grafana/Loki
+#   compose.yml + compose.prod.yml           production posture
+#
+# Five services, and the shape is not accidental:
+#
+#   nginx   serves static assets directly from the Nextcloud volume and
+#           forwards PHP to FPM over a socket-like TCP connection
+#   app     PHP-FPM. Serves no HTTP itself -- it speaks FastCGI
+#   cron    the SAME image running Nextcloud's background jobs on a timer
+#   db      MariaDB
+#   redis   distributed cache AND transactional file locking
+#
+# The nginx/FPM split is why this differs from a single-container Nextcloud:
+# static files (the web UI is thousands of them) are served by nginx without
+# ever entering PHP, and PHP worker count is tuned independently of connection
+# count. See docs/adr/001-container-strategy.md.
+# ---------------------------------------------------------------------------
+
+name: ${COMPOSE_PROJECT_NAME:-nextcloud}
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+# The app and cron containers run the SAME image with the same volumes and
+# nearly the same environment. Defining it once means they cannot drift --
+# and a cron container running a different Nextcloud version than the web
+# container corrupts data during an upgrade.
+x-nextcloud-common: &nextcloud-common
+  build:
+    context: .
+    dockerfile: docker/nextcloud/Dockerfile
+    args:
+      NEXTCLOUD_VERSION: ${NEXTCLOUD_VERSION:-34.0.3-fpm-alpine}
+      BUILD_DATE: ${BUILD_DATE:-unknown}
+      VCS_REF: ${VCS_REF:-unknown}
+  image: ${NEXTCLOUD_IMAGE:-nextcloud-private-cloud}:${NEXTCLOUD_IMAGE_TAG:-local}
+  restart: unless-stopped
+  security_opt:
+    - no-new-privileges:true
+  environment:
+    MYSQL_HOST: db
+    MYSQL_DATABASE: ${MYSQL_DATABASE:-nextcloud}
+    MYSQL_USER: ${MYSQL_USER:?set MYSQL_USER in .env}
+    MYSQL_PASSWORD: ${MYSQL_PASSWORD:?set MYSQL_PASSWORD in .env}
+
+    REDIS_HOST: redis
+    REDIS_HOST_PORT: "6379"
+    REDIS_HOST_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+
+    NEXTCLOUD_ADMIN_USER: ${NEXTCLOUD_ADMIN_USER:-admin}
+    NEXTCLOUD_ADMIN_PASSWORD: ${NEXTCLOUD_ADMIN_PASSWORD:?set NEXTCLOUD_ADMIN_PASSWORD in .env}
+    NEXTCLOUD_TRUSTED_DOMAINS: ${NEXTCLOUD_TRUSTED_DOMAINS:-nextcloud.localhost localhost}
+
+    # Consumed by config/nextcloud/zz-managed.config.php, which the entrypoint
+    # renders into Nextcloud's config directory.
+    TRUSTED_PROXIES: ${NEXTCLOUD_TRUSTED_PROXIES:-172.16.0.0/12}
+    OVERWRITEPROTOCOL: ${NEXTCLOUD_OVERWRITE_PROTOCOL:-https}
+    OVERWRITECLIURL: ${NEXTCLOUD_OVERWRITE_CLI_URL:-https://nextcloud.localhost:8443}
+    DEFAULT_QUOTA: ${NEXTCLOUD_DEFAULT_QUOTA:-10 GB}
+
+    PHP_UPLOAD_LIMIT: ${PHP_UPLOAD_LIMIT:-10G}
+    PHP_MEMORY_LIMIT: ${PHP_MEMORY_LIMIT:-1024M}
+    PHP_FPM_MAX_CHILDREN: ${PHP_FPM_MAX_CHILDREN:-32}
+    PHP_FPM_START_SERVERS: ${PHP_FPM_START_SERVERS:-8}
+    PHP_FPM_MIN_SPARE_SERVERS: ${PHP_FPM_MIN_SPARE_SERVERS:-4}
+    PHP_FPM_MAX_SPARE_SERVERS: ${PHP_FPM_MAX_SPARE_SERVERS:-12}
+
+    # Empty means local storage. Set, and file CONTENT moves to S3 while
+    # metadata stays in MariaDB -- see docs/adr/005-object-storage.md.
+    OBJECTSTORE_S3_BUCKET: ${OBJECTSTORE_S3_BUCKET:-}
+    OBJECTSTORE_S3_REGION: ${OBJECTSTORE_S3_REGION:-}
+    OBJECTSTORE_S3_HOST: ${OBJECTSTORE_S3_HOST:-}
+    OBJECTSTORE_S3_KEY: ${OBJECTSTORE_S3_KEY:-}
+    OBJECTSTORE_S3_SECRET: ${OBJECTSTORE_S3_SECRET:-}
+    OBJECTSTORE_S3_SSL: ${OBJECTSTORE_S3_SSL:-true}
+    OBJECTSTORE_S3_USEPATH_STYLE: ${OBJECTSTORE_S3_USEPATH_STYLE:-false}
+
+  volumes:
+    # The whole Nextcloud installation, not just data. The upstream image
+    # populates this on first start and updates it during an upgrade, so it
+    # must persist -- an ephemeral html volume means the upgrade runs again on
+    # every restart.
+    - nextcloud-html:/var/www/html
+    # User files. On a default install this is inside html; it is broken out
+    # so it can be backed up, sized and monitored independently, and so
+    # switching to object storage later changes one thing rather than two.
+    - nextcloud-data:/var/www/html/data
+
+  networks:
+    # Both networks. Nextcloud legitimately needs outbound HTTPS: the app
+    # store, federation with other instances, external storage backends, SMTP
+    # for notifications, and -- when enabled -- S3 primary storage. Confining
+    # it to the internal network would harden it at the cost of most of what
+    # makes it a private *cloud* rather than a file server.
+    #
+    # The database and Redis stay on the internal network only, which is where
+    # the segmentation actually earns its keep.
+    - backend
+    - frontend
+
+services:
+
+  # -------------------------------------------------------------------------
+  # MariaDB.
+  # -------------------------------------------------------------------------
+  db:
+    image: mariadb:${MARIADB_VERSION:-11.8.9-noble}
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+
+    # These three are not optional for Nextcloud and are the most commonly
+    # missed part of a MariaDB setup:
+    #
+    #   READ-COMMITTED  Nextcloud's file locking and its transaction handling
+    #                   deadlock under MariaDB's default REPEATABLE-READ. The
+    #                   symptom is intermittent "database deadlock" errors
+    #                   under concurrent access, which look like load and are
+    #                   really an isolation-level mismatch.
+    #   log-bin + ROW   binary logging in row format. Required for consistent
+    #                   point-in-time recovery and for any future replica; the
+    #                   default STATEMENT format is unsafe with the
+    #                   non-deterministic statements Nextcloud generates.
+    command:
+      - --transaction-isolation=READ-COMMITTED
+      - --log-bin=binlog
+      - --binlog-format=ROW
+      - --expire-logs-days=7
+
+    environment:
+      MARIADB_DATABASE: ${MYSQL_DATABASE:-nextcloud}
+      MARIADB_USER: ${MYSQL_USER:?set MYSQL_USER in .env}
+      MARIADB_PASSWORD: ${MYSQL_PASSWORD:?set MYSQL_PASSWORD in .env}
+      MARIADB_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in .env}
+      # Refuse to start with an empty root password rather than allowing one.
+      MARIADB_ROOT_HOST: localhost
+      MARIADB_AUTO_UPGRADE: "1"
+
+    volumes:
+      - db-data:/var/lib/mysql
+      - ./config/mariadb/my.cnf:/etc/mysql/conf.d/99-nextcloud.cnf:ro
+      # Backups are written from inside this container so mariadb-dump matches
+      # the server version. A dump taken by a mismatched client is a restore
+      # that fails at the worst possible moment.
+      - ${BACKUP_DIR:-./backups}:/backups
+
+    healthcheck:
+      # healthcheck.sh ships with the MariaDB image and is the supported way
+      # to check readiness. --connect alone reports ready before InnoDB has
+      # finished recovery, which is exactly the window Nextcloud must not
+      # start in.
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 60s
+
+    networks:
+      - backend
+
+    # No `ports:`. The database is reachable only from the backend network.
+
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+        reservations:
+          memory: 512m
+
+    stop_grace_period: 60s
+
+  # -------------------------------------------------------------------------
+  # Redis -- cache AND distributed file locking.
+  # -------------------------------------------------------------------------
+  # Not an optimisation. Nextcloud's transactional file locking uses Redis;
+  # without it Nextcloud falls back to database locking, which under
+  # concurrent access produces "file is currently locked" errors that users
+  # read as corruption. See docs/adr/004-redis-and-caching.md.
+  redis:
+    image: redis:${REDIS_VERSION:-8.8.2-alpine3.23}
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+
+    command:
+      - redis-server
+      - /usr/local/etc/redis/redis.conf
+      # Passed on the command line rather than baked into the config file, so
+      # the config can stay in version control without a credential in it.
+      - --requirepass
+      - ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+
+    volumes:
+      - ./config/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - redis-data:/data
+
+    healthcheck:
+      # $$ so Compose leaves the variable for the container's shell. A bare
+      # `redis-cli ping` returns NOAUTH once requirepass is set, which the
+      # healthcheck would read as unhealthy.
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+
+    networks:
+      - backend
+
+    deploy:
+      resources:
+        limits:
+          # maxmemory in redis.conf is set below this with an eviction policy,
+          # so Redis trims its own cache rather than being OOM-killed.
+          memory: 512m
+
+  # -------------------------------------------------------------------------
+  # Nextcloud -- PHP-FPM.
+  # -------------------------------------------------------------------------
+  app:
+    <<: *nextcloud-common
+    logging: *default-logging
+
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      # Generous: first start runs the Nextcloud installer, which creates the
+      # schema. Failures during start_period do not count against retries, so
+      # a large value costs nothing when startup is fast.
+      start_period: 180s
+      retries: 3
+
+    deploy:
+      resources:
+        limits:
+          # Must exceed PHP_FPM_MAX_CHILDREN x per-process memory. The
+          # arithmetic is in docs/architecture/capacity-planning.md; getting
+          # it wrong means the OOM killer instead of PHP's own memory_limit.
+          memory: 4g
+        reservations:
+          memory: 1g
+
+    stop_grace_period: 60s
+
+  # -------------------------------------------------------------------------
+  # Nextcloud background jobs.
+  # -------------------------------------------------------------------------
+  # A separate container running the SAME image, executing cron.php every five
+  # minutes.
+  #
+  # This is not optional housekeeping. Nextcloud's default is AJAX cron, which
+  # only runs when a user loads a page -- so on a quiet instance, file scans,
+  # trash expiry, share expiry, preview generation and database cleanup simply
+  # do not happen. The admin overview flags it, and it is the single most
+  # common misconfiguration in a self-hosted Nextcloud.
+  cron:
+    <<: *nextcloud-common
+    logging: *default-logging
+
+    depends_on:
+      app:
+        condition: service_healthy
+
+    # The upstream image ships this entrypoint specifically for the cron role.
+    entrypoint: /cron.sh
+
+    # The image declares a HEALTHCHECK that probes PHP-FPM on port 9000. This
+    # container runs /cron.sh, not php-fpm, so it would report unhealthy
+    # forever -- and an unhealthy container in `docker compose ps` trains an
+    # operator to ignore that column.
+    #
+    # Disabled rather than replaced: /cron.sh is a sleep loop with no endpoint
+    # to probe, and a process-liveness check would pass happily while cron.php
+    # failed on every run. Whether jobs are ACTUALLY running is monitored
+    # properly instead -- Nextcloud records a lastcron timestamp, and the
+    # NextcloudCronStale alert fires when it stops advancing. That is the
+    # check that means something.
+    healthcheck:
+      disable: true
+
+    deploy:
+      resources:
+        limits:
+          # Lower than app: one job at a time. Preview generation is the
+          # exception and is what this needs headroom for.
+          memory: 1g
+
+  # -------------------------------------------------------------------------
+  # nginx.
+  # -------------------------------------------------------------------------
+  proxy:
+    image: nginx:${NGINX_VERSION:-1.31.4-alpine3.24}
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+
+    depends_on:
+      app:
+        condition: service_healthy
+
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${HTTP_PORT:-8081}:80"
+      - "${BIND_ADDRESS:-127.0.0.1}:${HTTPS_PORT:-8444}:443"
+
+    environment:
+      NEXTCLOUD_DOMAIN: ${NEXTCLOUD_DOMAIN:-nextcloud.localhost}
+      PHP_UPLOAD_LIMIT: ${PHP_UPLOAD_LIMIT:-10G}
+      # Without this filter the image's envsubst pass replaces nginx's own
+      # $host, $remote_addr and $upstream_response_time with empty strings,
+      # producing a config that parses and logs nothing useful.
+      NGINX_ENVSUBST_FILTER: "^(NEXTCLOUD_|PHP_)"
+
+    volumes:
+      - ./config/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./config/nginx/conf.d:/etc/nginx/templates:ro
+      - ./config/nginx/snippets:/etc/nginx/snippets:ro
+      - ./config/nginx/tls:/etc/nginx/tls:ro
+      # nginx serves Nextcloud's static assets directly from the same volume
+      # the app container writes. Read-only: nginx must never modify it.
+      - nextcloud-html:/var/www/html:ro
+      - nginx-cache:/var/cache/nginx
+
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8081/stub_status || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    networks:
+      - frontend
+      - backend   # to reach PHP-FPM
+
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+
+    stop_grace_period: 30s
+
+# ---------------------------------------------------------------------------
+networks:
+  frontend:
+    driver: bridge
+  backend:
+    driver: bridge
+    # internal: no route off the host at all. MariaDB and Redis are attached
+    # only here, so a compromise of either cannot reach the internet -- and
+    # neither can anything that reaches them. The application tier is on both
+    # networks because it genuinely needs egress; the datastores do not.
+    internal: true
+
+volumes:
+  db-data:
+  redis-data:
+  nextcloud-html:
+  nextcloud-data:
+  nginx-cache:

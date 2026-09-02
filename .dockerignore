@@ -1,0 +1,18 @@
+# Keep the build context minimal.
+.git
+.github
+.gitignore
+.gitattributes
+docs
+tests
+monitoring
+infrastructure
+backups
+scripts
+*.md
+.env
+.env.*
+!.env.example
+config/nginx
+config/mariadb
+config/redis

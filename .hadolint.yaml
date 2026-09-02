@@ -1,0 +1,11 @@
+# Hadolint configuration.
+failure-threshold: warning
+
+ignored:
+  # DL3007 warns on `latest`. The base tag here is a datestamped ARG with a
+  # pinned default, which hadolint cannot resolve statically.
+  - DL3007
+
+trustedRegistries:
+  - docker.io
+  - ghcr.io
