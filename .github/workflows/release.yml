@@ -1,0 +1,176 @@
+# ---------------------------------------------------------------------------
+# Build, scan, sign and publish the Nextcloud runtime image.
+#
+# Runs on a tag, and on a schedule. The schedule is the part that is easy to
+# leave out and matters most: this repository's image is a thin layer over an
+# upstream Nextcloud image that is rebuilt regularly with security updates. Without
+# a periodic rebuild, an image that was clean when tagged silently accumulates
+# CVEs and nobody finds out until an audit.
+# ---------------------------------------------------------------------------
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  schedule:
+    # 04:00 UTC every Monday. Picks up upstream base image rebuilds.
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Push the image to the registry"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+
+  publish:
+    name: Build, scan and publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      # Required to mint the OIDC token that attestation signing uses. Without
+      # it, provenance cannot be attached and the step fails confusingly.
+      id-token: write
+      attestations: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to the registry
+        # Skipped on a pull request or a dry run: there is nothing to push and
+        # no credentials worth exposing.
+        if: github.event_name != 'workflow_dispatch' || inputs.publish
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=schedule,pattern={{date 'YYYYMMDD'}}
+            type=sha,format=long
+          labels: |
+            org.opencontainers.image.title=nextcloud-private-cloud
+            org.opencontainers.image.description=Nextcloud PHP-FPM runtime: healthcheck, managed configuration, tuned FPM pool
+            org.opencontainers.image.licenses=MIT
+
+      # Build to the local daemon first and scan before pushing. Publishing a
+      # vulnerable image and deleting it afterwards is not a recall: anything
+      # that pulled it in the interval still has it.
+      - name: Build for scanning
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/nextcloud/Dockerfile
+          load: true
+          push: false
+          tags: scan-target:${{ github.sha }}
+          build-args: |
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+            VCS_REF=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Trivy scan (gate)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: image
+          image-ref: scan-target:${{ github.sha }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      # Full inventory including unfixable findings, uploaded as an artefact.
+      # The gate above ignores unfixed CVEs so the pipeline stays meaningful;
+      # this keeps them visible rather than discarded.
+      - name: Trivy report (informational)
+        if: always()
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: image
+          image-ref: scan-target:${{ github.sha }}
+          severity: MEDIUM,HIGH,CRITICAL
+          format: table
+          output: trivy-report.txt
+          exit-code: "0"
+
+      - name: Generate SBOM
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: image
+          image-ref: scan-target:${{ github.sha }}
+          format: cyclonedx
+          output: sbom.cdx.json
+          exit-code: "0"
+
+      - name: Upload scan artefacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports-${{ github.sha }}
+          path: |
+            trivy-report.txt
+            sbom.cdx.json
+          retention-days: 90
+
+      - name: Push
+        id: push
+        if: github.event_name != 'workflow_dispatch' || inputs.publish
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/nextcloud/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+            VCS_REF=${{ github.sha }}
+          cache-from: type=gha
+
+      # Build provenance: a signed, verifiable statement of which workflow,
+      # from which commit, produced this digest. It is what makes the
+      # digest-pinned image reference in compose.prod.yml worth pinning.
+      - name: Attest provenance
+        if: steps.push.outcome == 'success'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Image"
+            echo
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo
+            echo "digest: \`${{ steps.push.outputs.digest }}\`"
+            echo
+            echo "Pin this digest in \`NEXTCLOUD_IMAGE_TAG\` for a production deploy."
+            echo "A tag is a mutable pointer; \"the same version\" must mean the same bytes."
+          } >> "$GITHUB_STEP_SUMMARY"

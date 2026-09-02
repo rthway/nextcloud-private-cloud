@@ -1,0 +1,30 @@
+# Copy to terraform.tfvars (git-ignored) and edit.
+
+aws_region   = "eu-west-1"
+project_name = "nextcloud"
+environment  = "prod"
+
+# Leave empty to generate a random suffix. S3 bucket names are a global
+# namespace, so an unqualified name will collide with someone else's.
+bucket_suffix = ""
+
+# Set false to create only the backup bucket -- useful if you want off-host
+# backups without moving primary storage to S3, which is a much smaller
+# change and does not require migrating existing files.
+enable_primary_storage_bucket = true
+
+# How long a superseded version of a file can be recovered. This is the window
+# in which an accidental overwrite or deletion is undoable, so it should
+# comfortably survive a long weekend.
+noncurrent_version_retention_days = 30
+
+# Backup tiering. expiration MUST exceed the longest retention in .env
+# (BACKUP_RETENTION_MONTHLY x ~30 days) or this silently deletes backups the
+# retention policy believes it is keeping.
+backup_transition_days = 30
+backup_glacier_days    = 90
+backup_expiration_days = 365
+
+# Keep false. With primary storage in the bucket, true means a stray
+# `terraform destroy` deletes every user's files with no undo.
+force_destroy_buckets = false

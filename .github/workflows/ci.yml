@@ -1,0 +1,278 @@
+# ---------------------------------------------------------------------------
+# Continuous integration.
+#
+# The gate for merging. Every job here can fail the build, and every job here
+# tests something that has a plausible way to break in production. There is no
+# step that echoes a message to make the pipeline look busy.
+#
+# Jobs run in parallel where they are independent and converge on a single
+# required status check, so branch protection needs one rule rather than five
+# that drift.
+# ---------------------------------------------------------------------------
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  # Manual runs are useful when a base image is republished and nothing in the
+  # repository has changed.
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Superseded runs on a feature branch are wasted minutes. main is never
+  # cancelled: its history of green builds is the record of what was
+  # releasable.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  # Pinned so a scanner or linter changing behaviour is a deliberate commit
+  # rather than a Tuesday morning surprise.
+  TRIVY_VERSION: "0.74.0"
+
+jobs:
+
+  # -------------------------------------------------------------------------
+  lint:
+    name: Lint (shell, Dockerfile, YAML)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install yamllint
+        run: pipx install yamllint
+
+      - name: ShellCheck
+        run: |
+          # -S warning: style suggestions are advisory; warnings and errors
+          # are not. -x follows sourced files.
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          failed=0
+          while IFS= read -r f; do
+            printf '  %s\n' "$f"
+            shellcheck -S warning -x "$f" || failed=1
+          done < <(git ls-files '*.sh')
+          exit $failed
+
+      - name: Executable bits
+        run: |
+          # A script committed without its executable bit fails on a Linux
+          # runner with a permission error that reads like a path problem.
+          # Windows checkouts lose the bit silently, so this is asserted.
+          bad=$(git ls-files -s '*.sh' | awk '$1 != "100755" {print $4}')
+          if [ -n "$bad" ]; then
+            echo "::error::not executable in git:"; echo "$bad"
+            echo "fix with: git update-index --chmod=+x <file>"
+            exit 1
+          fi
+          echo "all shell scripts are executable"
+
+      - name: hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: docker/nextcloud/Dockerfile
+          config: .hadolint.yaml
+          failure-threshold: warning
+
+      - name: yamllint
+        run: yamllint -c .yamllint .
+
+  # -------------------------------------------------------------------------
+  config:
+    name: Validate configuration
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PyYAML
+        run: pip install --quiet pyyaml
+
+      - name: Validate
+        run: ./tests/test-config.sh
+
+  # -------------------------------------------------------------------------
+  security:
+    name: Security scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # gitleaks needs the full history: a secret committed and later
+          # removed is still in the repository and still compromised.
+          fetch-depth: 0
+
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          # Unfixable findings are reviewed and recorded in SECURITY.md rather
+          # than failing the build permanently. A pipeline that is always red
+          # trains everyone to ignore it, and then a fixable CRITICAL goes
+          # unnoticed too.
+          ignore-unfixed: true
+          exit-code: "1"
+          skip-dirs: backups,tests/.tmp,secrets,config/nginx/tls,monitoring/mysqld-exporter
+          trivyignores: .trivyignore
+
+      - name: Assert no credential-shaped files are tracked
+        run: |
+          bad=$(git ls-files | grep -E '(^|/)(\.env|.*\.key|.*\.pem|id_rsa)$' | grep -v '\.example$' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::credential-shaped files are tracked:"; echo "$bad"; exit 1
+          fi
+          echo "no credential-shaped files tracked"
+
+  # -------------------------------------------------------------------------
+  terraform:
+    name: Validate Terraform
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.15.8"
+
+      - name: Format check
+        working-directory: infrastructure/terraform
+        run: terraform fmt -check -recursive -diff
+
+      - name: Validate
+        working-directory: infrastructure/terraform
+        # -backend=false: validation must not need cloud credentials or touch
+        # remote state. This checks the configuration is well-formed, which is
+        # what CI can honestly assert without an AWS account.
+        run: |
+          terraform init -backend=false
+          terraform validate
+
+  # -------------------------------------------------------------------------
+  # The job that matters most: build the image, start the whole stack,
+  # let it install itself, and exercise the real request path.
+  # Everything above tests artefacts in isolation; this tests the system.
+  integration:
+    name: Build and integration test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Prepare environment
+        run: |
+          ./scripts/gen-secrets.sh
+          ./scripts/gen-local-tls.sh
+          # The runner has no free privileged ports and no reason to publish.
+          sed -i 's/^HTTP_PORT=.*/HTTP_PORT=8080/;  s/^HTTPS_PORT=.*/HTTPS_PORT=8443/' .env
+          # Fewer PHP workers than the default: the runner has 2 vCPU, and
+          # oversubscribing makes the stack slower to become healthy, not
+          # faster. PHP_FPM_MAX_CHILDREN x PHP_MEMORY_LIMIT must also fit
+          # inside the runner's memory.
+          sed -i 's/^PHP_FPM_MAX_CHILDREN=.*/PHP_FPM_MAX_CHILDREN=6/;                   s/^PHP_FPM_START_SERVERS=.*/PHP_FPM_START_SERVERS=2/;                   s/^PHP_FPM_MIN_SPARE_SERVERS=.*/PHP_FPM_MIN_SPARE_SERVERS=1/;                   s/^PHP_FPM_MAX_SPARE_SERVERS=.*/PHP_FPM_MAX_SPARE_SERVERS=3/' .env
+
+      - name: Build image
+        run: |
+          BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+          VCS_REF=$(git rev-parse --short HEAD) \
+          docker compose build
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: image
+          image-ref: nextcloud-private-cloud:local
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Start stack
+        run: |
+          docker compose up -d
+          # Poll rather than sleep: the Nextcloud installer's duration varies
+          # with how many apps ship enabled, and a fixed sleep is either flaky
+          # or wasteful.
+          for i in $(seq 1 60); do
+            unhealthy=$(docker compose ps --format '{{.Service}} {{.Health}}' \
+                        | awk '$2 != "healthy" && $2 != "" {print $1}')
+            [ -z "$unhealthy" ] && echo "all healthy after $((i*5))s" && exit 0
+            sleep 5
+          done
+          echo "::error::services never became healthy: $unhealthy"
+          docker compose ps
+          docker compose logs --tail 100
+          exit 1
+
+      # No init step: unlike Odoo, the upstream Nextcloud image runs the
+      # installer on first start from NEXTCLOUD_ADMIN_USER and
+      # NEXTCLOUD_ADMIN_PASSWORD. This asserts it actually happened rather
+      # than assuming the healthcheck covers it.
+      - name: Confirm Nextcloud installed itself
+        run: |
+          ./scripts/occ.sh status
+          ./scripts/occ.sh status | grep -q 'installed: true'
+
+      - name: Smoke tests
+        run: ./tests/test-smoke.sh
+
+      # Proving the backup path in CI is the point: a backup procedure that is
+      # only exercised during an incident is a procedure nobody has tested.
+      - name: Backup, verify and restore
+        run: |
+          ./scripts/backup.sh --no-prune
+          ./scripts/verify-backup.sh
+          backup_id=$(ls -1 backups | tail -1)
+          ./scripts/restore.sh "$backup_id" --yes
+
+      - name: Health check after restore
+        run: ./scripts/healthcheck.sh
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          docker compose ps
+          docker compose logs --tail 200
+          df -h
+
+      - name: Tear down
+        if: always()
+        run: docker compose down --volumes --remove-orphans
+
+  # -------------------------------------------------------------------------
+  # A single required status check. Branch protection points at this one job,
+  # so adding or renaming a job above does not mean editing branch protection.
+  ci-passed:
+    name: CI passed
+    runs-on: ubuntu-latest
+    needs: [lint, config, security, terraform, integration]
+    if: always()
+    steps:
+      - name: Check results
+        run: |
+          # `needs.*.result` is 'success', 'failure', 'cancelled' or 'skipped'.
+          # Anything other than success must fail this job -- `if: always()`
+          # would otherwise report green when a dependency failed.
+          results='${{ join(needs.*.result, " ") }}'
+          echo "job results: $results"
+          for r in $results; do
+            [ "$r" = "success" ] || { echo "::error::a required job did not succeed"; exit 1; }
+          done
+          echo "all required jobs succeeded"

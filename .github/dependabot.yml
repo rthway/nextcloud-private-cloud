@@ -1,0 +1,40 @@
+# ---------------------------------------------------------------------------
+# Dependabot.
+#
+# The base images here are pinned to datestamped tags for reproducibility,
+# which means they do NOT float forward on their own. That is the correct
+# trade -- but it makes an update mechanism mandatory rather than optional,
+# because a pin without one is just an old image with extra steps.
+# ---------------------------------------------------------------------------
+version: 2
+
+updates:
+  - package-ecosystem: docker
+    directory: /docker/nextcloud
+    schedule:
+      interval: weekly
+      day: monday
+      time: "05:00"
+    open-pull-requests-limit: 5
+    labels: [dependencies, docker]
+    commit-message:
+      prefix: build
+      include: scope
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "05:00"
+    open-pull-requests-limit: 5
+    labels: [dependencies, ci]
+    commit-message:
+      prefix: ci
+      include: scope
+    groups:
+      # One pull request for routine action bumps rather than six. Grouping
+      # keeps review attention for the changes that deserve it.
+      actions:
+        patterns: ["*"]
+        update-types: [minor, patch]
