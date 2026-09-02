@@ -83,6 +83,18 @@ jobs:
       - name: yamllint
         run: yamllint -c .yamllint .
 
+      # actionlint validates the workflow files themselves -- YAML validity is
+      # not enough. GitHub Actions expressions accept ONLY single quotes for
+      # string literals, and a double quote inside ${{ }} makes the whole file
+      # unparseable: the run fails before any job starts, with
+      # "This run likely failed because of a workflow file issue" and no line
+      # number. That is exactly what happened on this repository's first push,
+      # so the check that would have caught it now runs on every push.
+      - name: actionlint
+        uses: docker://rhysd/actionlint:latest
+        with:
+          args: -color
+
   # -------------------------------------------------------------------------
   config:
     name: Validate configuration
@@ -239,7 +251,9 @@ jobs:
         run: |
           ./scripts/backup.sh --no-prune
           ./scripts/verify-backup.sh
-          backup_id=$(ls -1 backups | tail -1)
+          # find, not ls: parsing ls output breaks on unusual filenames,
+          # and actionlint runs shellcheck over these blocks.
+          backup_id=$(find backups -mindepth 1 -maxdepth 1 -type d -exec basename {} \; | sort | tail -1)
           ./scripts/restore.sh "$backup_id" --yes
 
       - name: Health check after restore
@@ -270,7 +284,7 @@ jobs:
           # `needs.*.result` is 'success', 'failure', 'cancelled' or 'skipped'.
           # Anything other than success must fail this job -- `if: always()`
           # would otherwise report green when a dependency failed.
-          results='${{ join(needs.*.result, " ") }}'
+          results='${{ join(needs.*.result, ' ') }}'
           echo "job results: $results"
           for r in $results; do
             [ "$r" = "success" ] || { echo "::error::a required job did not succeed"; exit 1; }
